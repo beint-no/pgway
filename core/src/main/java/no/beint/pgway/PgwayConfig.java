@@ -18,18 +18,17 @@ import javax.sql.DataSource;
  *
  * <p>Conventions:
  * <ul>
- *   <li>Migrations live in {@code db/migration} on the classpath unless directories or sources are supplied</li>
+ *   <li>Versioned migrations {@code V1__*.sql}, {@code V2__*.sql}, ... live in {@code db/migration}</li>
  *   <li>Target schema is {@code public} (non-{@code public} schemas are created automatically)</li>
- *   <li>History table is always {@code pgway_schema_history} in the target schema</li>
+ *   <li>History table is always {@code pgway_history} in the target schema</li>
  *   <li>Migrations are always validated and strictly ordered before execution</li>
  * </ul>
  */
 public final class PgwayConfig {
     public static final String DEFAULT_SCHEMA = "public";
-    public static final String HISTORY_TABLE = "pgway_schema_history";
+    public static final String HISTORY_TABLE = "pgway_history";
     public static final String DEFAULT_CLASSPATH_LOCATION = "db/migration";
     public static final Duration DEFAULT_LOCK_TIMEOUT = Duration.ofSeconds(30);
-    static final String BASELINE_DESCRIPTION = "<< Pgway Baseline >>";
 
     private final DataSource dataSource;
     private final List<MigrationSource> sources;
@@ -37,8 +36,6 @@ public final class PgwayConfig {
     private final Duration lockTimeout;
     private final Duration migrationLockTimeout;
     private final Duration migrationStatementTimeout;
-    private final boolean baselineOnMigrate;
-    private final MigrationVersion baselineVersion;
     private final MigrationListener listener;
 
     private PgwayConfig(Builder builder) {
@@ -54,8 +51,6 @@ public final class PgwayConfig {
         this.migrationStatementTimeout = builder.migrationStatementTimeout == null
             ? null
             : validateNonNegative(builder.migrationStatementTimeout, "migrationStatementTimeout");
-        this.baselineOnMigrate = builder.baselineOnMigrate;
-        this.baselineVersion = Objects.requireNonNull(builder.baselineVersion, "baselineVersion must not be null");
         this.listener = Objects.requireNonNull(builder.listener, "listener must not be null");
     }
 
@@ -91,14 +86,6 @@ public final class PgwayConfig {
         return PgIdentifiers.deriveAdvisoryLockKey(schema, HISTORY_TABLE);
     }
 
-    public boolean baselineOnMigrate() {
-        return baselineOnMigrate;
-    }
-
-    public MigrationVersion baselineVersion() {
-        return baselineVersion;
-    }
-
     public MigrationListener listener() {
         return listener;
     }
@@ -118,8 +105,6 @@ public final class PgwayConfig {
         private Duration lockTimeout = DEFAULT_LOCK_TIMEOUT;
         private Duration migrationLockTimeout;
         private Duration migrationStatementTimeout;
-        private boolean baselineOnMigrate = false;
-        private MigrationVersion baselineVersion = MigrationVersion.parse("1");
         private MigrationListener listener = MigrationListener.NOOP;
 
         private Builder() {}
@@ -191,21 +176,6 @@ public final class PgwayConfig {
 
         public Builder migrationStatementTimeout(Duration migrationStatementTimeout) {
             this.migrationStatementTimeout = migrationStatementTimeout;
-            return this;
-        }
-
-        public Builder baselineOnMigrate(boolean baselineOnMigrate) {
-            this.baselineOnMigrate = baselineOnMigrate;
-            return this;
-        }
-
-        public Builder baselineVersion(MigrationVersion baselineVersion) {
-            this.baselineVersion = baselineVersion;
-            return this;
-        }
-
-        public Builder baselineVersion(String baselineVersion) {
-            this.baselineVersion = MigrationVersion.parse(baselineVersion);
             return this;
         }
 

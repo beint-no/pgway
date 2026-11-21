@@ -5,8 +5,7 @@ import java.util.Objects;
 
 /** Combined status view of a migration across discovered scripts and database history. */
 public record MigrationInfo(
-        MigrationKind kind,
-        MigrationVersion version,
+        int version,
         String description,
         String script,
         MigrationState state,
@@ -16,7 +15,9 @@ public record MigrationInfo(
         Integer executionMs) {
 
     public MigrationInfo {
-        Objects.requireNonNull(kind, "kind must not be null");
+        if (version <= 0) {
+            throw new IllegalArgumentException("version must be positive: " + version);
+        }
         Objects.requireNonNull(description, "description must not be null");
         Objects.requireNonNull(script, "script must not be null");
         Objects.requireNonNull(state, "state must not be null");

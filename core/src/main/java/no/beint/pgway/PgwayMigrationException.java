@@ -4,7 +4,7 @@ package no.beint.pgway;
 public final class PgwayMigrationException extends PgwayException {
     private static final long serialVersionUID = 1L;
     private final String script;
-    private final transient MigrationVersion version;
+    private final int version;
     private final int statementIndex;
     private final int line;
     private final String sqlState;
@@ -12,7 +12,7 @@ public final class PgwayMigrationException extends PgwayException {
     public PgwayMigrationException(String message, Throwable cause) {
         super(message, cause);
         this.script = null;
-        this.version = null;
+        this.version = 0;
         this.statementIndex = 0;
         this.line = 0;
         this.sqlState = null;
@@ -20,7 +20,7 @@ public final class PgwayMigrationException extends PgwayException {
 
     public PgwayMigrationException(
             String script,
-            MigrationVersion version,
+            int version,
             int statementIndex,
             int line,
             String sqlState,
@@ -38,7 +38,8 @@ public final class PgwayMigrationException extends PgwayException {
         return script;
     }
 
-    public MigrationVersion version() {
+    /** Positive version number, or {@code 0} if not tied to a specific migration. */
+    public int version() {
         return version;
     }
 

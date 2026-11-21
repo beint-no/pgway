@@ -83,7 +83,8 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
                 receipt,
                 "schema=" + schema + "\n"
                     + "migrations=" + first.appliedCount() + "\n"
-                    + "version=" + (first.currentVersion() != null ? first.currentVersion().value() : "none") + "\n"
+                    + "version=V" + first.currentVersion() + "\n"
+                    + "v1.checksum=" + first.applied().getFirst().checksum() + "\n"
             );
             getLogger().lifecycle(
                 "Pgway verified {} migration(s) for schema '{}' against PostgreSQL 19+ ({} ms)",

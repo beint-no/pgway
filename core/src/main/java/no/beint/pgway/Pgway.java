@@ -6,13 +6,14 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Convention-first PostgreSQL 19+ schema migration engine for JDK 27.
@@ -21,7 +22,11 @@ import java.util.Objects;
  * are serialized via PostgreSQL session-level advisory locks.
  */
 public final class Pgway {
-    private static final String BASELINE_CHECKSUM = "baseline";
+    /**
+     * Scoped value bound for the duration of each migration and its {@link MigrationListener} callbacks.
+     */
+    public static final ScopedValue<MigrationContext> CURRENT_MIGRATION = ScopedValue.newInstance();
+
     private final PgwayConfig config;
 
     private Pgway(PgwayConfig config) {
@@ -34,6 +39,11 @@ public final class Pgway {
 
     public static Pgway create(PgwayConfig config) {
         return new Pgway(config);
+    }
+
+    /** Returns the active migration context if called within a running migration or listener callback. */
+    public static Optional<MigrationContext> currentMigration() {
+        return CURRENT_MIGRATION.isBound() ? Optional.of(CURRENT_MIGRATION.get()) : Optional.empty();
     }
 
     /** Offline build-time validation of migration filenames, UTF-8 encoding, duplicates, directives, and SQL syntax. */
@@ -52,9 +62,8 @@ public final class Pgway {
     }
 
     /**
-     * Validates PostgreSQL 19+, acquires the advisory lock, ensures the schema and history table
-     * (optionally baselining a pre-existing non-empty schema), validates history integrity, and applies
-     * all pending versioned and repeatable migrations.
+     * Validates PostgreSQL 19+, acquires the advisory lock, ensures the schema and {@code pgway_history}
+     * exist, validates history integrity, and applies all pending versioned migrations in strict order.
      */
     public MigrationResult migrate() {
         long startNanos = System.nanoTime();
@@ -63,45 +72,15 @@ public final class Pgway {
             throw new PgwayValidationException(loaded.issues());
         }
 
-        return withLockedSession((connection, baseSettings) -> {
-            SchemaHistoryRepository.ensureSchema(connection, config.schema());
-
-            boolean baselined = false;
-            boolean historyExists = SchemaHistoryRepository.tableExists(
-                connection,
-                config.schema(),
-                PgwayConfig.HISTORY_TABLE
-            );
-
-            if (!historyExists) {
-                boolean nonEmptySchema = config.baselineOnMigrate()
-                    && SchemaHistoryRepository.schemaHasObjects(
-                        connection,
-                        config.schema(),
-                        PgwayConfig.HISTORY_TABLE
-                    );
+        return withLockedSession((connection, session) -> {
+            if (!session.historyExists()) {
                 connection.setAutoCommit(false);
                 try {
-                    SchemaHistoryRepository.createHistoryTable(
+                    SchemaHistoryRepository.ensureSchemaAndHistoryTable(
                         connection,
                         config.schema(),
                         PgwayConfig.HISTORY_TABLE
                     );
-                    if (nonEmptySchema) {
-                        SchemaHistoryRepository.insertHistoryRow(
-                            connection,
-                            config.schema(),
-                            PgwayConfig.HISTORY_TABLE,
-                            config.baselineVersion(),
-                            MigrationKind.BASELINE,
-                            PgwayConfig.BASELINE_DESCRIPTION,
-                            PgwayConfig.BASELINE_DESCRIPTION,
-                            BASELINE_CHECKSUM,
-                            0,
-                            true
-                        );
-                        baselined = true;
-                    }
                     connection.commit();
                 } catch (SQLException e) {
                     rollbackQuietly(connection, e);
@@ -117,39 +96,92 @@ public final class Pgway {
                 PgwayConfig.HISTORY_TABLE
             );
 
-            List<ValidationIssue> issues = validateAgainstHistory(loaded, history);
+            List<ValidationIssue> issues = validateAgainstHistory(loaded.scripts(), history);
             if (!issues.isEmpty()) {
                 throw new PgwayValidationException(issues);
             }
 
-            HistorySummary summary = summarizeHistory(history);
+            Map<Integer, AppliedMigration> appliedByVersion = new HashMap<>(history.size() * 2);
+            int currentVersion = 0;
+            for (AppliedMigration row : history) {
+                if (row.success()) {
+                    appliedByVersion.put(row.version(), row);
+                    if (row.version() > currentVersion) {
+                        currentVersion = row.version();
+                    }
+                }
+            }
+
             List<AppliedMigration> newlyApplied = new ArrayList<>();
             int skipped = 0;
 
-            for (MigrationScript script : loaded.versioned()) {
-                if (summary.appliedByVersion.containsKey(script.version())) {
+            for (MigrationScript script : loaded.scripts()) {
+                if (appliedByVersion.containsKey(script.version())) {
                     skipped++;
                     continue;
                 }
-                if (summary.baselineVersion != null && script.version().compareTo(summary.baselineVersion) <= 0) {
-                    skipped++;
-                    continue;
+                session.markSettingsDirty();
+                AppliedMigration applied = executeMigration(connection, script, session.baseSettings());
+                newlyApplied.add(applied);
+                if (applied.version() > currentVersion) {
+                    currentVersion = applied.version();
                 }
-                newlyApplied.add(executeMigration(connection, script, baseSettings));
             }
 
-            for (MigrationScript script : loaded.repeatable()) {
-                AppliedMigration latest = summary.latestRepeatableByScript.get(script.scriptName());
-                if (latest != null && latest.checksum().equals(script.checksum())) {
-                    skipped++;
-                    continue;
-                }
-                newlyApplied.add(executeMigration(connection, script, baseSettings));
-            }
-
-            MigrationVersion currentVersion = computeCurrentVersion(history, newlyApplied);
             Duration totalDuration = Duration.ofNanos(System.nanoTime() - startNanos);
-            return new MigrationResult(newlyApplied, skipped, currentVersion, totalDuration, baselined);
+            return new MigrationResult(newlyApplied, skipped, currentVersion, totalDuration);
+        });
+    }
+
+    /**
+     * Atomically replaces {@code pgway_history} with a single applied row for {@code V1}
+     * (creating the target schema and history table if absent).
+     *
+     * <p>Use this when cutting over an existing database or after squashing {@code V1..Vn}
+     * into a compacted {@code V1} schema script.
+     */
+    public AppliedMigration compactHistory() {
+        MigrationLoader.LoadedMigrations loaded = MigrationLoader.load(config.sources());
+        if (!loaded.issues().isEmpty()) {
+            throw new PgwayValidationException(loaded.issues());
+        }
+        MigrationScript v1 = loaded.scripts().stream()
+            .filter(s -> s.version() == 1)
+            .findFirst()
+            .orElseThrow(() -> new PgwayValidationException(new ValidationIssue(
+                ValidationErrorCode.MISSING_MIGRATION,
+                null,
+                1,
+                "Cannot compact history: V1 migration script not found in migration sources"
+            )));
+
+        return withLockedSession((connection, _) -> {
+            connection.setAutoCommit(false);
+            try {
+                SchemaHistoryRepository.ensureSchemaAndHistoryTable(
+                    connection,
+                    config.schema(),
+                    PgwayConfig.HISTORY_TABLE
+                );
+                SchemaHistoryRepository.truncateHistory(connection, config.schema(), PgwayConfig.HISTORY_TABLE);
+                AppliedMigration row = SchemaHistoryRepository.insertHistoryRow(
+                    connection,
+                    config.schema(),
+                    PgwayConfig.HISTORY_TABLE,
+                    v1.version(),
+                    v1.scriptName(),
+                    v1.checksum(),
+                    0,
+                    true
+                );
+                connection.commit();
+                return row;
+            } catch (SQLException e) {
+                rollbackQuietly(connection, e);
+                throw e;
+            } finally {
+                connection.setAutoCommit(true);
+            }
         });
     }
 
@@ -160,14 +192,14 @@ public final class Pgway {
         MigrationLoader.LoadedMigrations loaded = MigrationLoader.load(config.sources());
         List<ValidationIssue> issues = new ArrayList<>(loaded.issues());
 
-        withReadOnlySession(connection -> {
-            if (SchemaHistoryRepository.tableExists(connection, config.schema(), PgwayConfig.HISTORY_TABLE)) {
+        withReadOnlySession((connection, historyExists) -> {
+            if (historyExists) {
                 List<AppliedMigration> history = SchemaHistoryRepository.readHistory(
                     connection,
                     config.schema(),
                     PgwayConfig.HISTORY_TABLE
                 );
-                issues.addAll(validateAgainstHistory(loaded, history));
+                issues.addAll(validateAgainstHistory(loaded.scripts(), history));
             }
             return null;
         });
@@ -190,80 +222,57 @@ public final class Pgway {
             throw new PgwayValidationException(loaded.issues());
         }
 
-        List<AppliedMigration> history = withReadOnlySession(connection -> {
-            if (!SchemaHistoryRepository.tableExists(connection, config.schema(), PgwayConfig.HISTORY_TABLE)) {
-                return List.of();
-            }
-            return SchemaHistoryRepository.readHistory(connection, config.schema(), PgwayConfig.HISTORY_TABLE);
-        });
+        List<AppliedMigration> history = withReadOnlySession((connection, historyExists) ->
+            historyExists
+                ? SchemaHistoryRepository.readHistory(connection, config.schema(), PgwayConfig.HISTORY_TABLE)
+                : List.of()
+        );
 
-        HistorySummary summary = summarizeHistory(history);
-        Map<MigrationVersion, MigrationScript> scriptsByVersion = new LinkedHashMap<>();
-        for (MigrationScript script : loaded.versioned()) {
+        Map<Integer, MigrationScript> scriptsByVersion = new LinkedHashMap<>();
+        for (MigrationScript script : loaded.scripts()) {
             scriptsByVersion.put(script.version(), script);
         }
 
         List<MigrationInfo> result = new ArrayList<>();
-        Map<MigrationVersion, Boolean> emittedVersions = new HashMap<>();
+        Map<Integer, Boolean> emittedVersions = new HashMap<>();
+        int highestApplied = 0;
 
         for (AppliedMigration row : history) {
-            if (row.kind() == MigrationKind.BASELINE) {
-                result.add(new MigrationInfo(
-                    MigrationKind.BASELINE,
-                    row.version(),
-                    row.description(),
-                    row.script(),
-                    row.success() ? MigrationState.BASELINE : MigrationState.FAILED,
-                    row.checksum(),
-                    row.checksum(),
-                    row.installedOn(),
-                    row.executionMs()
-                ));
-                if (row.version() != null) {
-                    emittedVersions.put(row.version(), true);
-                }
-            } else if (row.kind() == MigrationKind.VERSIONED) {
-                MigrationScript script = scriptsByVersion.get(row.version());
-                MigrationState state;
-                if (!row.success()) {
-                    state = MigrationState.FAILED;
-                } else if (script == null) {
-                    state = MigrationState.MISSING;
-                } else if (!script.checksum().equals(row.checksum())) {
-                    state = MigrationState.CHECKSUM_MISMATCH;
-                } else {
-                    state = MigrationState.APPLIED;
-                }
-                result.add(new MigrationInfo(
-                    MigrationKind.VERSIONED,
-                    row.version(),
-                    row.description(),
-                    row.script(),
-                    state,
-                    script != null ? script.checksum() : null,
-                    row.checksum(),
-                    row.installedOn(),
-                    row.executionMs()
-                ));
-                emittedVersions.put(row.version(), true);
+            if (row.success() && row.version() > highestApplied) {
+                highestApplied = row.version();
             }
+            MigrationScript script = scriptsByVersion.get(row.version());
+            MigrationState state;
+            if (!row.success()) {
+                state = MigrationState.FAILED;
+            } else if (script == null) {
+                state = MigrationState.MISSING;
+            } else if (!script.checksum().equals(row.checksum())) {
+                state = MigrationState.CHECKSUM_MISMATCH;
+            } else {
+                state = MigrationState.APPLIED;
+            }
+            result.add(new MigrationInfo(
+                row.version(),
+                script != null ? script.description() : MigrationLoader.descriptionFromScriptName(row.script()),
+                row.script(),
+                state,
+                script != null ? script.checksum() : null,
+                row.checksum(),
+                row.installedOn(),
+                row.executionMs()
+            ));
+            emittedVersions.put(row.version(), true);
         }
 
-        for (MigrationScript script : loaded.versioned()) {
+        for (MigrationScript script : loaded.scripts()) {
             if (emittedVersions.containsKey(script.version())) {
                 continue;
             }
-            MigrationState state;
-            if (summary.baselineVersion != null && script.version().compareTo(summary.baselineVersion) <= 0) {
-                state = MigrationState.BELOW_BASELINE;
-            } else if (summary.highestAppliedVersion != null
-                    && script.version().compareTo(summary.highestAppliedVersion) < 0) {
-                state = MigrationState.OUT_OF_ORDER;
-            } else {
-                state = MigrationState.PENDING;
-            }
+            MigrationState state = (highestApplied > 0 && script.version() < highestApplied)
+                ? MigrationState.OUT_OF_ORDER
+                : MigrationState.PENDING;
             result.add(new MigrationInfo(
-                MigrationKind.VERSIONED,
                 script.version(),
                 script.description(),
                 script.scriptName(),
@@ -273,59 +282,6 @@ public final class Pgway {
                 null,
                 null
             ));
-        }
-
-        for (MigrationScript script : loaded.repeatable()) {
-            AppliedMigration latest = summary.latestRepeatableByScript.get(script.scriptName());
-            if (latest == null) {
-                result.add(new MigrationInfo(
-                    MigrationKind.REPEATABLE,
-                    null,
-                    script.description(),
-                    script.scriptName(),
-                    MigrationState.PENDING,
-                    script.checksum(),
-                    null,
-                    null,
-                    null
-                ));
-            } else if (!latest.success()) {
-                result.add(new MigrationInfo(
-                    MigrationKind.REPEATABLE,
-                    null,
-                    script.description(),
-                    script.scriptName(),
-                    MigrationState.FAILED,
-                    script.checksum(),
-                    latest.checksum(),
-                    latest.installedOn(),
-                    latest.executionMs()
-                ));
-            } else if (!latest.checksum().equals(script.checksum())) {
-                result.add(new MigrationInfo(
-                    MigrationKind.REPEATABLE,
-                    null,
-                    script.description(),
-                    script.scriptName(),
-                    MigrationState.OUTDATED,
-                    script.checksum(),
-                    latest.checksum(),
-                    latest.installedOn(),
-                    latest.executionMs()
-                ));
-            } else {
-                result.add(new MigrationInfo(
-                    MigrationKind.REPEATABLE,
-                    null,
-                    script.description(),
-                    script.scriptName(),
-                    MigrationState.APPLIED,
-                    script.checksum(),
-                    latest.checksum(),
-                    latest.installedOn(),
-                    latest.executionMs()
-                ));
-            }
         }
 
         return List.copyOf(result);
@@ -338,18 +294,18 @@ public final class Pgway {
 
     /**
      * Under advisory lock, deletes failed ({@code success = false}) history rows and optionally
-     * realigns applied versioned checksums and descriptions with the current migration scripts.
+     * realigns applied checksums and script names with the current migration scripts.
      */
     public RepairResult repair(boolean realignChecksums) {
         MigrationLoader.LoadedMigrations loaded = realignChecksums
             ? MigrationLoader.load(config.sources())
-            : new MigrationLoader.LoadedMigrations(List.of(), List.of(), List.of());
+            : new MigrationLoader.LoadedMigrations(List.of(), List.of());
         if (!loaded.issues().isEmpty()) {
             throw new PgwayValidationException(loaded.issues());
         }
 
-        return withLockedSession((connection, ignored) -> {
-            if (!SchemaHistoryRepository.tableExists(connection, config.schema(), PgwayConfig.HISTORY_TABLE)) {
+        return withLockedSession((connection, session) -> {
+            if (!session.historyExists()) {
                 return new RepairResult(0, 0, List.of());
             }
             List<String> details = new ArrayList<>();
@@ -368,8 +324,8 @@ public final class Pgway {
                 }
 
                 if (realignChecksums) {
-                    Map<MigrationVersion, MigrationScript> byVersion = new HashMap<>();
-                    for (MigrationScript script : loaded.versioned()) {
+                    Map<Integer, MigrationScript> byVersion = new HashMap<>();
+                    for (MigrationScript script : loaded.scripts()) {
                         byVersion.put(script.version(), script);
                     }
                     List<AppliedMigration> history = SchemaHistoryRepository.readHistory(
@@ -378,20 +334,18 @@ public final class Pgway {
                         PgwayConfig.HISTORY_TABLE
                     );
                     for (AppliedMigration row : history) {
-                        if (row.kind() != MigrationKind.VERSIONED || !row.success()) {
+                        if (!row.success()) {
                             continue;
                         }
                         MigrationScript script = byVersion.get(row.version());
                         if (script != null && (!script.checksum().equals(row.checksum())
-                                || !script.description().equals(row.description())
                                 || !script.scriptName().equals(row.script()))) {
-                            SchemaHistoryRepository.updateChecksumAndDescription(
+                            SchemaHistoryRepository.updateChecksumAndScript(
                                 connection,
                                 config.schema(),
                                 PgwayConfig.HISTORY_TABLE,
-                                row.installedRank(),
+                                row.version(),
                                 script.checksum(),
-                                script.description(),
                                 script.scriptName()
                             );
                             realigned++;
@@ -410,86 +364,32 @@ public final class Pgway {
         });
     }
 
-    /** Baselines an existing database at {@code version}. Fails if the history table already contains rows. */
-    public BaselineResult baseline(String version) {
-        return baseline(MigrationVersion.parse(version));
-    }
-
-    /** Baselines an existing database at {@code version}. Fails if the history table already contains rows. */
-    public BaselineResult baseline(MigrationVersion version) {
-        Objects.requireNonNull(version, "version must not be null");
-
-        return withLockedSession((connection, ignored) -> {
-            SchemaHistoryRepository.ensureSchema(connection, config.schema());
-            boolean exists = SchemaHistoryRepository.tableExists(
-                connection,
-                config.schema(),
-                PgwayConfig.HISTORY_TABLE
-            );
-            if (exists) {
-                List<AppliedMigration> history = SchemaHistoryRepository.readHistory(
-                    connection,
-                    config.schema(),
-                    PgwayConfig.HISTORY_TABLE
-                );
-                if (!history.isEmpty()) {
-                    throw new PgwayValidationException(new ValidationIssue(
-                        ValidationErrorCode.BASELINE_FAILED,
-                        null,
-                        version,
-                        "Cannot baseline: history table "
-                            + PgIdentifiers.qualifiedTable(config.schema(), PgwayConfig.HISTORY_TABLE)
-                            + " already contains " + history.size() + " row(s)"
-                    ));
-                }
-            }
-            connection.setAutoCommit(false);
-            try {
-                SchemaHistoryRepository.createHistoryTable(
-                    connection,
-                    config.schema(),
-                    PgwayConfig.HISTORY_TABLE
-                );
-                SchemaHistoryRepository.insertHistoryRow(
-                    connection,
-                    config.schema(),
-                    PgwayConfig.HISTORY_TABLE,
-                    version,
-                    MigrationKind.BASELINE,
-                    PgwayConfig.BASELINE_DESCRIPTION,
-                    PgwayConfig.BASELINE_DESCRIPTION,
-                    BASELINE_CHECKSUM,
-                    0,
-                    true
-                );
-                connection.commit();
-            } catch (SQLException e) {
-                rollbackQuietly(connection, e);
-                throw e;
-            } finally {
-                connection.setAutoCommit(true);
-            }
-            return new BaselineResult(true, version);
-        });
-    }
-
     private AppliedMigration executeMigration(
             Connection connection,
             MigrationScript script,
             SchemaHistoryRepository.SessionSettings baseSettings) throws SQLException {
-        config.listener().beforeMigration(script);
-        long startNanos = System.nanoTime();
-        Duration effectiveLockTimeout = script.directives().lockTimeout() != null
-            ? script.directives().lockTimeout()
-            : config.migrationLockTimeout();
-        Duration effectiveStmtTimeout = script.directives().statementTimeout() != null
-            ? script.directives().statementTimeout()
-            : config.migrationStatementTimeout();
+        MigrationContext ctx = new MigrationContext(
+            config.schema(),
+            script.version(),
+            script.scriptName(),
+            script.checksum(),
+            Instant.now()
+        );
+        return ScopedValue.where(CURRENT_MIGRATION, ctx).call(() -> {
+            config.listener().beforeMigration(script);
+            long startNanos = System.nanoTime();
+            Duration effectiveLockTimeout = script.directives().lockTimeout() != null
+                ? script.directives().lockTimeout()
+                : config.migrationLockTimeout();
+            Duration effectiveStmtTimeout = script.directives().statementTimeout() != null
+                ? script.directives().statementTimeout()
+                : config.migrationStatementTimeout();
 
-        if (script.directives().transactional()) {
-            return executeTransactional(connection, script, effectiveLockTimeout, effectiveStmtTimeout, baseSettings, startNanos);
-        }
-        return executeNonTransactional(connection, script, effectiveLockTimeout, effectiveStmtTimeout, baseSettings, startNanos);
+            if (script.directives().transactional()) {
+                return executeTransactional(connection, script, effectiveLockTimeout, effectiveStmtTimeout, baseSettings, startNanos);
+            }
+            return executeNonTransactional(connection, script, effectiveLockTimeout, effectiveStmtTimeout, baseSettings, startNanos);
+        });
     }
 
     private AppliedMigration executeTransactional(
@@ -502,10 +402,12 @@ public final class Pgway {
         connection.setAutoCommit(false);
         SqlStatement currentStmt = null;
         try {
-            applyMigrationContext(connection, lockTimeout, statementTimeout, true);
-            for (SqlStatement sqlStmt : script.statements()) {
-                currentStmt = sqlStmt;
-                executeSingleStatement(connection, sqlStmt);
+            SchemaHistoryRepository.applyMigrationSettings(connection, config.schema(), lockTimeout, statementTimeout, true);
+            try (Statement stmt = connection.createStatement()) {
+                for (SqlStatement sqlStmt : script.statements()) {
+                    currentStmt = sqlStmt;
+                    executeSingleStatement(stmt, sqlStmt);
+                }
             }
             currentStmt = null;
             int elapsedMs = elapsedMillis(startNanos);
@@ -514,8 +416,6 @@ public final class Pgway {
                 config.schema(),
                 PgwayConfig.HISTORY_TABLE,
                 script.version(),
-                script.kind(),
-                script.description(),
                 script.scriptName(),
                 script.checksum(),
                 elapsedMs,
@@ -533,7 +433,7 @@ public final class Pgway {
             try {
                 connection.setAutoCommit(true);
                 SchemaHistoryRepository.restoreSessionSettings(connection, baseSettings);
-            } catch (SQLException ignored) {
+            } catch (SQLException _) {
                 // Handled by outer session cleanup or discarded if connection broke
             }
         }
@@ -549,10 +449,12 @@ public final class Pgway {
         connection.setAutoCommit(true);
         SqlStatement currentStmt = null;
         try {
-            applyMigrationContext(connection, lockTimeout, statementTimeout, false);
-            for (SqlStatement sqlStmt : script.statements()) {
-                currentStmt = sqlStmt;
-                executeSingleStatement(connection, sqlStmt);
+            SchemaHistoryRepository.applyMigrationSettings(connection, config.schema(), lockTimeout, statementTimeout, false);
+            try (Statement stmt = connection.createStatement()) {
+                for (SqlStatement sqlStmt : script.statements()) {
+                    currentStmt = sqlStmt;
+                    executeSingleStatement(stmt, sqlStmt);
+                }
             }
             currentStmt = null;
             int elapsedMs = elapsedMillis(startNanos);
@@ -561,8 +463,6 @@ public final class Pgway {
                 config.schema(),
                 PgwayConfig.HISTORY_TABLE,
                 script.version(),
-                script.kind(),
-                script.description(),
                 script.scriptName(),
                 script.checksum(),
                 elapsedMs,
@@ -579,8 +479,6 @@ public final class Pgway {
                     config.schema(),
                     PgwayConfig.HISTORY_TABLE,
                     script.version(),
-                    script.kind(),
-                    script.description(),
                     script.scriptName(),
                     script.checksum(),
                     elapsedMs,
@@ -595,54 +493,25 @@ public final class Pgway {
         } finally {
             try {
                 SchemaHistoryRepository.restoreSessionSettings(connection, baseSettings);
-            } catch (SQLException ignored) {
+            } catch (SQLException _) {
                 // Handled by outer session cleanup or discarded if connection broke
             }
         }
     }
 
-    private void applyMigrationContext(
-            Connection connection,
-            Duration lockTimeout,
-            Duration statementTimeout,
-            boolean isLocal) throws SQLException {
-        String prefix = isLocal ? "SET LOCAL search_path TO " : "SET search_path TO ";
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute(prefix + PgIdentifiers.quote(config.schema()));
-        }
-        if (lockTimeout != null) {
-            SchemaHistoryRepository.setConfig(
-                connection,
-                "lock_timeout",
-                PgIdentifiers.formatPgDuration(lockTimeout),
-                isLocal
-            );
-        }
-        if (statementTimeout != null) {
-            SchemaHistoryRepository.setConfig(
-                connection,
-                "statement_timeout",
-                PgIdentifiers.formatPgDuration(statementTimeout),
-                isLocal
-            );
-        }
-    }
-
-    private static void executeSingleStatement(Connection connection, SqlStatement sqlStmt) throws SQLException {
-        try (Statement stmt = connection.createStatement()) {
-            boolean hasResultSet = stmt.execute(sqlStmt.sql());
-            while (true) {
-                if (hasResultSet) {
-                    try (ResultSet rs = stmt.getResultSet()) {
-                        while (rs.next()) {
-                            // Drain all rows so lazy SRF/function errors surface immediately.
-                        }
+    private static void executeSingleStatement(Statement stmt, SqlStatement sqlStmt) throws SQLException {
+        boolean hasResultSet = stmt.execute(sqlStmt.sql());
+        while (true) {
+            if (hasResultSet) {
+                try (ResultSet rs = stmt.getResultSet()) {
+                    while (rs.next()) {
+                        // Drain all rows so lazy SRF/function errors surface immediately.
                     }
-                } else if (stmt.getUpdateCount() == -1) {
-                    break;
                 }
-                hasResultSet = stmt.getMoreResults();
+            } else if (stmt.getUpdateCount() == -1) {
+                break;
             }
+            hasResultSet = stmt.getMoreResults();
         }
     }
 
@@ -653,11 +522,8 @@ public final class Pgway {
         int stmtIndex = failedStmt != null ? failedStmt.index() : 0;
         int line = failedStmt != null ? failedStmt.startLine() : 0;
         StringBuilder msg = new StringBuilder();
-        msg.append("Migration ").append(script.scriptName());
-        if (script.version() != null) {
-            msg.append(" (V").append(script.version()).append(")");
-        }
-        msg.append(" failed");
+        msg.append("Migration ").append(script.scriptName())
+            .append(" (V").append(script.version()).append(") failed");
         if (failedStmt != null) {
             msg.append(" at statement #").append(stmtIndex).append(" (line ").append(line).append(")");
         }
@@ -677,29 +543,36 @@ public final class Pgway {
     }
 
     private List<ValidationIssue> validateAgainstHistory(
-            MigrationLoader.LoadedMigrations loaded,
+            List<MigrationScript> scripts,
             List<AppliedMigration> history) {
         List<ValidationIssue> issues = new ArrayList<>();
+        Map<Integer, AppliedMigration> appliedByVersion = new HashMap<>(history.size() * 2);
+        int highestApplied = 0;
+
         for (AppliedMigration row : history) {
             if (!row.success()) {
                 issues.add(new ValidationIssue(
                     ValidationErrorCode.FAILED_MIGRATION_IN_HISTORY,
                     row.script(),
                     row.version(),
-                    "Failed migration in history (rank=" + row.installedRank() + ", script='" + row.script()
+                    "Failed migration in history (V" + row.version() + ", script='" + row.script()
                         + "'). Inspect the database for partial changes and run repair() before migrating."
                 ));
+                continue;
+            }
+            appliedByVersion.put(row.version(), row);
+            if (row.version() > highestApplied) {
+                highestApplied = row.version();
             }
         }
 
-        HistorySummary summary = summarizeHistory(history);
-        Map<MigrationVersion, MigrationScript> scriptsByVersion = new HashMap<>();
-        for (MigrationScript script : loaded.versioned()) {
+        Map<Integer, MigrationScript> scriptsByVersion = new HashMap<>(scripts.size() * 2);
+        for (MigrationScript script : scripts) {
             scriptsByVersion.put(script.version(), script);
         }
 
         for (AppliedMigration row : history) {
-            if (!row.success() || row.kind() != MigrationKind.VERSIONED) {
+            if (!row.success()) {
                 continue;
             }
             MigrationScript script = scriptsByVersion.get(row.version());
@@ -722,82 +595,21 @@ public final class Pgway {
             }
         }
 
-        if (summary.highestAppliedVersion != null) {
-            for (MigrationScript script : loaded.versioned()) {
-                if (summary.appliedByVersion.containsKey(script.version())) {
-                    continue;
-                }
-                if (summary.baselineVersion != null && script.version().compareTo(summary.baselineVersion) <= 0) {
-                    continue;
-                }
-                if (script.version().compareTo(summary.highestAppliedVersion) < 0) {
+        if (highestApplied > 0) {
+            for (MigrationScript script : scripts) {
+                if (!appliedByVersion.containsKey(script.version()) && script.version() < highestApplied) {
                     issues.add(new ValidationIssue(
                         ValidationErrorCode.OUT_OF_ORDER_PENDING,
                         script.scriptName(),
                         script.version(),
                         "Pending migration V" + script.version() + " (" + script.scriptName()
-                            + ") is lower than highest applied version V" + summary.highestAppliedVersion
+                            + ") is lower than highest applied version V" + highestApplied
                     ));
                 }
             }
         }
 
         return issues;
-    }
-
-    private record HistorySummary(
-            Map<MigrationVersion, AppliedMigration> appliedByVersion,
-            Map<String, AppliedMigration> latestRepeatableByScript,
-            MigrationVersion highestAppliedVersion,
-            MigrationVersion baselineVersion) {}
-
-    private static HistorySummary summarizeHistory(List<AppliedMigration> history) {
-        Map<MigrationVersion, AppliedMigration> byVersion = new HashMap<>();
-        Map<String, AppliedMigration> latestRepeatable = new HashMap<>();
-        MigrationVersion highest = null;
-        MigrationVersion baseline = null;
-
-        for (AppliedMigration row : history) {
-            if (!row.success()) {
-                if (row.kind() == MigrationKind.REPEATABLE) {
-                    latestRepeatable.put(row.script(), row);
-                }
-                continue;
-            }
-            switch (row.kind()) {
-                case VERSIONED -> {
-                    byVersion.put(row.version(), row);
-                    if (highest == null || row.version().compareTo(highest) > 0) {
-                        highest = row.version();
-                    }
-                }
-                case BASELINE -> {
-                    baseline = row.version();
-                    if (row.version() != null && (highest == null || row.version().compareTo(highest) > 0)) {
-                        highest = row.version();
-                    }
-                }
-                case REPEATABLE -> latestRepeatable.put(row.script(), row);
-            }
-        }
-        return new HistorySummary(byVersion, latestRepeatable, highest, baseline);
-    }
-
-    private static MigrationVersion computeCurrentVersion(
-            List<AppliedMigration> existing,
-            List<AppliedMigration> newlyApplied) {
-        List<MigrationVersion> versions = new ArrayList<>();
-        for (AppliedMigration row : existing) {
-            if (row.success() && row.version() != null) {
-                versions.add(row.version());
-            }
-        }
-        for (AppliedMigration row : newlyApplied) {
-            if (row.success() && row.version() != null) {
-                versions.add(row.version());
-            }
-        }
-        return versions.stream().max(Comparator.naturalOrder()).orElse(null);
     }
 
     private static int elapsedMillis(long startNanos) {
@@ -812,14 +624,41 @@ public final class Pgway {
         }
     }
 
+    private static final class LockedSession {
+        private final SchemaHistoryRepository.SessionSettings baseSettings;
+        private final boolean historyExists;
+        private boolean settingsDirty;
+
+        LockedSession(SchemaHistoryRepository.LockedSessionInfo info) {
+            this.baseSettings = info.baseSettings();
+            this.historyExists = info.historyExists();
+        }
+
+        SchemaHistoryRepository.SessionSettings baseSettings() {
+            return baseSettings;
+        }
+
+        boolean historyExists() {
+            return historyExists;
+        }
+
+        void markSettingsDirty() {
+            this.settingsDirty = true;
+        }
+
+        boolean settingsDirty() {
+            return settingsDirty;
+        }
+    }
+
     @FunctionalInterface
     private interface ReadOnlyWork<T> {
-        T run(Connection connection) throws SQLException;
+        T run(Connection connection, boolean historyExists) throws SQLException;
     }
 
     @FunctionalInterface
     private interface LockedWork<T> {
-        T run(Connection connection, SchemaHistoryRepository.SessionSettings baseSettings) throws SQLException;
+        T run(Connection connection, LockedSession session) throws SQLException;
     }
 
     private <T> T withReadOnlySession(ReadOnlyWork<T> work) {
@@ -829,14 +668,18 @@ public final class Pgway {
                 if (!originalAutoCommit) {
                     connection.setAutoCommit(true);
                 }
-                SchemaHistoryRepository.verifyPostgres19OrHigher(connection);
-                return work.run(connection);
+                boolean historyExists = SchemaHistoryRepository.openReadOnlySession(
+                    connection,
+                    config.schema(),
+                    PgwayConfig.HISTORY_TABLE
+                );
+                return work.run(connection, historyExists);
             } finally {
                 try {
                     if (!connection.isClosed() && connection.getAutoCommit() != originalAutoCommit) {
                         connection.setAutoCommit(originalAutoCommit);
                     }
-                } catch (SQLException ignored) {
+                } catch (SQLException _) {
                     // Connection already broken
                 }
             }
@@ -851,18 +694,23 @@ public final class Pgway {
         long lockKey = config.advisoryLockKey();
         try (Connection connection = config.dataSource().getConnection()) {
             boolean originalAutoCommit = connection.getAutoCommit();
-            SchemaHistoryRepository.SessionSettings baseSettings = null;
+            LockedSession session = null;
             boolean lockAcquired = false;
             Throwable primaryError = null;
             try {
                 if (!originalAutoCommit) {
                     connection.setAutoCommit(true);
                 }
-                SchemaHistoryRepository.verifyPostgres19OrHigher(connection);
-                baseSettings = SchemaHistoryRepository.captureSessionSettings(connection);
-                SchemaHistoryRepository.acquireAdvisoryLock(connection, lockKey, config.lockTimeout());
+                SchemaHistoryRepository.LockedSessionInfo info = SchemaHistoryRepository.openLockedSession(
+                    connection,
+                    lockKey,
+                    config.lockTimeout(),
+                    config.schema(),
+                    PgwayConfig.HISTORY_TABLE
+                );
                 lockAcquired = true;
-                return work.run(connection, baseSettings);
+                session = new LockedSession(info);
+                return work.run(connection, session);
             } catch (Throwable t) {
                 primaryError = t;
                 throw t;
@@ -879,8 +727,8 @@ public final class Pgway {
                             }
                             connection.setAutoCommit(true);
                         }
-                        if (baseSettings != null) {
-                            SchemaHistoryRepository.restoreSessionSettings(connection, baseSettings);
+                        if (session != null && session.settingsDirty()) {
+                            SchemaHistoryRepository.restoreSessionSettings(connection, session.baseSettings());
                         }
                         if (lockAcquired) {
                             SchemaHistoryRepository.releaseAdvisoryLock(connection, lockKey);

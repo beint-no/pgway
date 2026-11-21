@@ -2,7 +2,6 @@ package no.beint.pgway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -21,7 +20,7 @@ import org.junit.jupiter.api.Test;
 class PgwayIntegrationTest {
 
     @Test
-    void migratesFreshDatabaseInNumericOrderAndIsIdempotent() throws Exception {
+    void migratesFreshDatabaseInNumericOrderBindsScopedValueAndIsIdempotent() throws Exception {
         Pg19TestCluster pg = Pg19TestCluster.shared();
         String db = pg.createDatabase("fresh");
 
@@ -31,6 +30,7 @@ class PgwayIntegrationTest {
             "V10__ten.sql", "INSERT INTO items (id, name) VALUES (10, 'ten');"
         ));
 
+        assertTrue(Pgway.currentMigration().isEmpty());
         List<String> events = new ArrayList<>();
         Pgway pgway = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
@@ -38,28 +38,42 @@ class PgwayIntegrationTest {
             .listener(new MigrationListener() {
                 @Override
                 public void beforeMigration(MigrationScript script) {
-                    events.add("before:" + script.version());
+                    MigrationContext ctx = Pgway.currentMigration().orElseThrow();
+                    assertEquals("public", ctx.schema());
+                    assertEquals(script.version(), ctx.version());
+                    assertEquals(script.scriptName(), ctx.script());
+                    events.add("before:" + ctx.version());
                 }
 
                 @Override
                 public void afterMigration(AppliedMigration applied) {
-                    events.add("after:" + applied.version());
+                    MigrationContext ctx = Pgway.currentMigration().orElseThrow();
+                    assertEquals(applied.version(), ctx.version());
+                    events.add("after:" + ctx.version());
                 }
             })
             .create();
 
         MigrationResult first = pgway.migrate();
+        assertTrue(Pgway.currentMigration().isEmpty());
         assertEquals(3, first.appliedCount());
         assertEquals(0, first.skippedCount());
-        assertEquals(MigrationVersion.parse("10"), first.currentVersion());
-        assertFalse(first.baselined());
+        assertEquals(10, first.currentVersion());
         assertEquals(List.of("before:1", "after:1", "before:2", "after:2", "before:10", "after:10"), events);
+
+        // Verify 32-byte raw SHA-256 bytea storage in pgway_history
+        try (Connection c = pg.connect(db); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT version, octet_length(checksum) FROM pgway_history ORDER BY version")) {
+            assertTrue(rs.next());
+            assertEquals(1, rs.getInt(1));
+            assertEquals(32, rs.getInt(2));
+        }
 
         // Second run is a clean no-op
         MigrationResult second = pgway.migrate();
         assertEquals(0, second.appliedCount());
         assertEquals(3, second.skippedCount());
-        assertEquals(MigrationVersion.parse("10"), second.currentVersion());
+        assertEquals(10, second.currentVersion());
 
         // Validate & info
         assertTrue(pgway.validate().valid());
@@ -133,49 +147,6 @@ class PgwayIntegrationTest {
     }
 
     @Test
-    void supportsRepeatableMigrationsAndRerunsOnlyOnChecksumChange() throws Exception {
-        Pg19TestCluster pg = Pg19TestCluster.shared();
-        String db = pg.createDatabase("repeatable");
-
-        var v1 = "CREATE TABLE events (id int PRIMARY KEY, kind text NOT NULL);";
-        var r1 = "CREATE OR REPLACE VIEW event_summary AS SELECT count(*)::int AS cnt FROM events;";
-        var r2 = "CREATE OR REPLACE VIEW event_summary AS SELECT count(*)::int AS cnt, max(id) AS max_id FROM events;";
-
-        Pgway pgway1 = Pgway.configure()
-            .dataSource(pg.url(db), pg.user(), pg.password())
-            .source(InMemoryMigrationSource.ofStrings(Map.of(
-                "V1__events.sql", v1,
-                "R__event_summary.sql", r1
-            )))
-            .create();
-
-        MigrationResult res1 = pgway1.migrate();
-        assertEquals(2, res1.appliedCount());
-        assertEquals(MigrationKind.VERSIONED, res1.applied().get(0).kind());
-        assertEquals(MigrationKind.REPEATABLE, res1.applied().get(1).kind());
-
-        // Unchanged repeatable is skipped
-        assertEquals(0, pgway1.migrate().appliedCount());
-
-        // Changed repeatable shows OUTDATED in info() and re-runs on migrate()
-        Pgway pgway2 = Pgway.configure()
-            .dataSource(pg.url(db), pg.user(), pg.password())
-            .source(InMemoryMigrationSource.ofStrings(Map.of(
-                "V1__events.sql", v1,
-                "R__event_summary.sql", r2
-            )))
-            .create();
-
-        var infoBefore = pgway2.info();
-        assertEquals(MigrationState.OUTDATED, infoBefore.get(1).state());
-
-        MigrationResult res2 = pgway2.migrate();
-        assertEquals(1, res2.appliedCount());
-        assertEquals(MigrationKind.REPEATABLE, res2.applied().get(0).kind());
-        assertEquals(MigrationState.APPLIED, pgway2.info().get(1).state());
-    }
-
-    @Test
     void supportsCustomSchemaAndRestoresSearchPath() throws Exception {
         Pg19TestCluster pg = Pg19TestCluster.shared();
         String db = pg.createDatabase("custom_schema");
@@ -183,7 +154,6 @@ class PgwayIntegrationTest {
         var source = InMemoryMigrationSource.ofStrings(Map.of(
             "V1__utin_tables.sql", """
                 CREATE TABLE campaigns (id int PRIMARY KEY);
-                -- Deliberately mutate session search_path inside migration to prove Pgway isolates it:
                 SET search_path TO public;
                 """,
             "V2__second_in_utin.sql", """
@@ -202,7 +172,7 @@ class PgwayIntegrationTest {
 
         try (Connection conn = pg.connect(db); Statement stmt = conn.createStatement()) {
             try (ResultSet rs = stmt.executeQuery(
-                "SELECT count(*) FROM pg_tables WHERE schemaname = 'utin' AND tablename IN ('campaigns', 'ads', 'pgway_schema_history')"
+                "SELECT count(*) FROM pg_tables WHERE schemaname = 'utin' AND tablename IN ('campaigns', 'ads', 'pgway_history')"
             )) {
                 assertTrue(rs.next());
                 assertEquals(3, rs.getInt(1));
@@ -220,13 +190,12 @@ class PgwayIntegrationTest {
         hc.setUsername(pg.user());
         hc.setPassword(pg.password());
         hc.setAutoCommit(false);
-        hc.setMaximumPoolSize(1); // Prove single-connection pool works cleanly!
+        hc.setMaximumPoolSize(1);
         hc.addDataSourceProperty("autosave", "always");
         hc.addDataSourceProperty("cleanupSavepoints", "true");
         hc.addDataSourceProperty("options", "-c jit=off");
 
         try (HikariDataSource ds = new HikariDataSource(hc)) {
-            // 1. Failing transactional migration must roll back statement 1 even with autosave=always!
             Pgway failing = Pgway.configure()
                 .dataSource(ds)
                 .source(InMemoryMigrationSource.ofStrings(Map.of(
@@ -239,11 +208,11 @@ class PgwayIntegrationTest {
 
             PgwayMigrationException ex = assertThrows(PgwayMigrationException.class, failing::migrate);
             assertEquals("V1__partial.sql", ex.script());
+            assertEquals(1, ex.version());
             assertEquals(2, ex.statementIndex());
             assertEquals(2, ex.line());
             assertEquals("42P01", ex.sqlState());
 
-            // Verify pool connection returned with autoCommit=false, table rolled back, NO dirty failed row
             try (Connection c = ds.getConnection()) {
                 assertFalse(c.getAutoCommit(), "HikariCP autoCommit=false must be preserved");
                 try (Statement s = c.createStatement();
@@ -254,7 +223,6 @@ class PgwayIntegrationTest {
                 c.rollback();
             }
 
-            // 2. Fix script and migrate cleanly without repair()
             Pgway fixed = Pgway.configure()
                 .dataSource(ds)
                 .source(InMemoryMigrationSource.ofStrings(Map.of(
@@ -264,7 +232,7 @@ class PgwayIntegrationTest {
 
             MigrationResult res = fixed.migrate();
             assertEquals(1, res.appliedCount());
-            assertNotNull(res.currentVersion());
+            assertEquals(1, res.currentVersion());
 
             try (Connection c = ds.getConnection()) {
                 assertFalse(c.getAutoCommit());
@@ -357,7 +325,7 @@ class PgwayIntegrationTest {
 
         MigrationResult res = pgway.migrate();
         assertEquals(2, res.appliedCount());
-        assertEquals(MigrationVersion.parse("2"), res.currentVersion());
+        assertEquals(2, res.currentVersion());
         assertTrue(pgway.validate().valid());
     }
 
@@ -373,7 +341,6 @@ class PgwayIntegrationTest {
         hc.setMaximumPoolSize(1);
 
         try (HikariDataSource ds = new HikariDataSource(hc)) {
-            // Capture initial pool settings
             String initialLockTimeout;
             String initialStmtTimeout;
             try (Connection c = ds.getConnection(); Statement s = c.createStatement();
@@ -383,7 +350,6 @@ class PgwayIntegrationTest {
                 initialStmtTimeout = rs.getString(2);
             }
 
-            // V1 mutates session-level settings (forgetting LOCAL); V2 must NOT inherit them
             Pgway pgway = Pgway.configure()
                 .dataSource(ds)
                 .source(InMemoryMigrationSource.ofStrings(Map.of(
@@ -406,7 +372,6 @@ class PgwayIntegrationTest {
 
             assertEquals(2, pgway.migrate().appliedCount());
 
-            // Pooled connection returned to app must also have original settings restored
             try (Connection c = ds.getConnection(); Statement s = c.createStatement();
                  ResultSet rs = s.executeQuery("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")) {
                 rs.next();
@@ -414,7 +379,6 @@ class PgwayIntegrationTest {
                 assertEquals(initialStmtTimeout, rs.getString(2));
             }
 
-            // Failing V3 whose statement 1 returns a ResultSet must still roll back statement 1 completely
             Pgway failingV3 = Pgway.configure()
                 .dataSource(ds)
                 .source(InMemoryMigrationSource.ofStrings(Map.of(

@@ -39,17 +39,15 @@ public final class PgwayAutoConfiguration {
             ObjectProvider<MigrationListener> listenerProvider) {
         PgwayConfig.Builder builder = Pgway.configure()
             .dataSource(dataSource)
-            .schema(properties.getSchema())
-            .lockTimeout(properties.getLockTimeout())
-            .baselineOnMigrate(properties.isBaselineOnMigrate())
-            .baselineVersion(properties.getBaselineVersion())
+            .schema(properties.schema())
+            .lockTimeout(properties.lockTimeout())
             .source(new SpringResourceMigrationSource(resourcePatternResolver));
 
-        if (properties.getMigrationLockTimeout() != null) {
-            builder.migrationLockTimeout(properties.getMigrationLockTimeout());
+        if (properties.migrationLockTimeout() != null) {
+            builder.migrationLockTimeout(properties.migrationLockTimeout());
         }
-        if (properties.getMigrationStatementTimeout() != null) {
-            builder.migrationStatementTimeout(properties.getMigrationStatementTimeout());
+        if (properties.migrationStatementTimeout() != null) {
+            builder.migrationStatementTimeout(properties.migrationStatementTimeout());
         }
         MigrationListener listener = listenerProvider.getIfAvailable();
         if (listener != null) {

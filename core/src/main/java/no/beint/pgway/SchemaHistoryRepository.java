@@ -9,28 +9,41 @@ import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 
 /**
- * PostgreSQL 19+ metadata, session settings, advisory locking, and schema history persistence.
+ * PostgreSQL 19+ session setup, advisory locking, and {@code pgway_history} persistence.
+ *
+ * <p>Combines version verification, session setting capture, bounded advisory lock acquisition,
+ * and history table existence checks into single round-trips wherever possible.
  */
 final class SchemaHistoryRepository {
     private static final int PG19_MIN_VERSION_NUM = 190000;
     private static final String SQLSTATE_LOCK_NOT_AVAILABLE = "55P03";
+    private static final HexFormat HEX = HexFormat.of();
 
     private SchemaHistoryRepository() {}
 
     record SessionSettings(String searchPath, String lockTimeout, String statementTimeout) {}
 
-    static void verifyPostgres19OrHigher(Connection connection) {
-        try (Statement stmt = connection.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT current_setting('server_version_num')::int, version()")) {
-            if (!rs.next()) {
-                throw new PgwayUnsupportedDatabaseException(-1, "", "Unable to determine PostgreSQL server version");
+    record LockedSessionInfo(SessionSettings baseSettings, boolean historyExists) {}
+
+    static boolean openReadOnlySession(Connection connection, String schema, String table) {
+        String sql = """
+            SELECT current_setting('server_version_num')::int,
+                   version(),
+                   to_regclass(?) IS NOT NULL
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, PgIdentifiers.qualifiedTable(schema, table));
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    throw new PgwayUnsupportedDatabaseException(-1, "", "Unable to determine PostgreSQL server version");
+                }
+                validateServerVersion(rs.getInt(1), rs.getString(2));
+                return rs.getBoolean(3);
             }
-            int versionNum = rs.getInt(1);
-            String versionStr = rs.getString(2);
-            validateServerVersion(versionNum, versionStr);
         } catch (PgwayUnsupportedDatabaseException e) {
             throw e;
         } catch (SQLException e) {
@@ -38,6 +51,85 @@ final class SchemaHistoryRepository {
                 "Pgway requires PostgreSQL 19 or higher, but version query failed: " + e.getMessage(),
                 e
             );
+        }
+    }
+
+    /**
+     * In a single atomic round-trip: checks PostgreSQL 19+, captures baseline session settings,
+     * bounds lock acquisition with {@code SET LOCAL lock_timeout}, acquires the session advisory lock,
+     * and checks whether {@code pgway_history} already exists.
+     */
+    static LockedSessionInfo openLockedSession(
+            Connection connection,
+            long lockKey,
+            Duration lockTimeout,
+            String schema,
+            String table) throws SQLException {
+        String sql = """
+            WITH cfg AS MATERIALIZED (
+                SELECT current_setting('server_version_num')::int AS ver_num,
+                       version()                                  AS ver_str,
+                       current_setting('search_path')             AS search_path,
+                       current_setting('lock_timeout')            AS lock_timeout,
+                       current_setting('statement_timeout')       AS statement_timeout,
+                       set_config('lock_timeout', ?, true)        AS applied_timeout
+            )
+            SELECT ver_num,
+                   ver_str,
+                   search_path,
+                   lock_timeout,
+                   statement_timeout,
+                   CASE WHEN ver_num >= 190000 THEN pg_advisory_lock(?) END,
+                   to_regclass(?) IS NOT NULL AS history_exists
+            FROM cfg
+            """;
+        connection.setAutoCommit(false);
+        try {
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setString(1, PgIdentifiers.formatPgDuration(lockTimeout));
+                ps.setLong(2, lockKey);
+                ps.setString(3, PgIdentifiers.qualifiedTable(schema, table));
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new PgwayUnsupportedDatabaseException(-1, "", "Unable to determine PostgreSQL server version");
+                    }
+                    int versionNum = rs.getInt(1);
+                    String versionStr = rs.getString(2);
+                    validateServerVersion(versionNum, versionStr);
+                    SessionSettings settings = new SessionSettings(
+                        rs.getString(3),
+                        rs.getString(4),
+                        rs.getString(5)
+                    );
+                    boolean historyExists = rs.getBoolean(7);
+                    connection.commit();
+                    return new LockedSessionInfo(settings, historyExists);
+                }
+            }
+        } catch (PgwayUnsupportedDatabaseException e) {
+            try {
+                connection.rollback();
+            } catch (SQLException suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            throw e;
+        } catch (SQLException e) {
+            try {
+                connection.rollback();
+            } catch (SQLException suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            if (SQLSTATE_LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw new PgwayLockException(
+                    lockKey,
+                    lockTimeout,
+                    "Timed out after " + lockTimeout + " waiting for Pgway advisory lock (" + lockKey + ")",
+                    e
+                );
+            }
+            throw e;
+        } finally {
+            connection.setAutoCommit(true);
         }
     }
 
@@ -53,15 +145,31 @@ final class SchemaHistoryRepository {
         }
     }
 
-    static SessionSettings captureSessionSettings(Connection connection) throws SQLException {
+    static void applyMigrationSettings(
+            Connection connection,
+            String schema,
+            Duration lockTimeout,
+            Duration statementTimeout,
+            boolean isLocal) throws SQLException {
         String sql = """
-            SELECT current_setting('search_path'),
-                   current_setting('lock_timeout'),
-                   current_setting('statement_timeout')
+            SELECT set_config('search_path', ?, ?),
+                   CASE WHEN ?::text IS NOT NULL THEN set_config('lock_timeout', ?, ?) END,
+                   CASE WHEN ?::text IS NOT NULL THEN set_config('statement_timeout', ?, ?) END
             """;
-        try (Statement stmt = connection.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
-            rs.next();
-            return new SessionSettings(rs.getString(1), rs.getString(2), rs.getString(3));
+        String lockVal = lockTimeout != null ? PgIdentifiers.formatPgDuration(lockTimeout) : null;
+        String stmtVal = statementTimeout != null ? PgIdentifiers.formatPgDuration(statementTimeout) : null;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, PgIdentifiers.quote(schema));
+            ps.setBoolean(2, isLocal);
+            ps.setString(3, lockVal);
+            ps.setString(4, lockVal);
+            ps.setBoolean(5, isLocal);
+            ps.setString(6, stmtVal);
+            ps.setString(7, stmtVal);
+            ps.setBoolean(8, isLocal);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+            }
         }
     }
 
@@ -81,50 +189,6 @@ final class SchemaHistoryRepository {
         }
     }
 
-    static void setConfig(Connection connection, String settingName, String value, boolean isLocal) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT set_config(?, ?, ?)")) {
-            ps.setString(1, settingName);
-            ps.setString(2, value);
-            ps.setBoolean(3, isLocal);
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-            }
-        }
-    }
-
-    static void acquireAdvisoryLock(Connection connection, long lockKey, Duration timeout) throws SQLException {
-        // Acquire session-level advisory lock inside a tiny transaction so SET LOCAL lock_timeout
-        // bounds the wait and automatically resets at commit, while the session lock remains held.
-        connection.setAutoCommit(false);
-        try {
-            setConfig(connection, "lock_timeout", PgIdentifiers.formatPgDuration(timeout), true);
-            try (PreparedStatement ps = connection.prepareStatement("SELECT pg_advisory_lock(?)")) {
-                ps.setLong(1, lockKey);
-                try (ResultSet rs = ps.executeQuery()) {
-                    rs.next();
-                }
-            }
-            connection.commit();
-        } catch (SQLException e) {
-            try {
-                connection.rollback();
-            } catch (SQLException suppressed) {
-                e.addSuppressed(suppressed);
-            }
-            if (SQLSTATE_LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                throw new PgwayLockException(
-                    lockKey,
-                    timeout,
-                    "Timed out after " + timeout + " waiting for Pgway advisory lock (" + lockKey + ")",
-                    e
-                );
-            }
-            throw e;
-        } finally {
-            connection.setAutoCommit(true);
-        }
-    }
-
     static void releaseAdvisoryLock(Connection connection, long lockKey) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement("SELECT pg_advisory_unlock(?)")) {
             ps.setLong(1, lockKey);
@@ -134,126 +198,47 @@ final class SchemaHistoryRepository {
         }
     }
 
-    static void ensureSchema(Connection connection, String schema) throws SQLException {
-        if (PgwayConfig.DEFAULT_SCHEMA.equals(schema)) {
-            return;
-        }
-        try (Statement stmt = connection.createStatement()) {
-            stmt.execute("CREATE SCHEMA IF NOT EXISTS " + PgIdentifiers.quote(schema));
-        }
-    }
-
-    static boolean tableExists(Connection connection, String schema, String table) throws SQLException {
-        String sql = """
-            SELECT 1
-            FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = ?
-              AND c.relname = ?
-              AND c.relkind IN ('r', 'p')
-            """;
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, schema);
-            ps.setString(2, table);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
-            }
-        }
-    }
-
-    static boolean schemaHasObjects(Connection connection, String schema, String excludedTable) throws SQLException {
-        String relationSql = """
-            SELECT 1
-            FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = ?
-              AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
-              AND c.relname <> ?
-            LIMIT 1
-            """;
-        try (PreparedStatement ps = connection.prepareStatement(relationSql)) {
-            ps.setString(1, schema);
-            ps.setString(2, excludedTable);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return true;
-                }
-            }
-        }
-        String procSql = """
-            SELECT 1
-            FROM pg_catalog.pg_proc p
-            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname = ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM pg_catalog.pg_depend d
-                  WHERE d.classid = 'pg_catalog.pg_proc'::regclass
-                    AND d.objid = p.oid
-                    AND d.deptype = 'e'
-              )
-            LIMIT 1
-            """;
-        try (PreparedStatement ps = connection.prepareStatement(procSql)) {
-            ps.setString(1, schema);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
-            }
-        }
-    }
-
-    static void createHistoryTable(Connection connection, String schema, String table) throws SQLException {
+    static void ensureSchemaAndHistoryTable(Connection connection, String schema, String table) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
-        String idxName = PgIdentifiers.quote(table + "_ver_uniq_idx");
         try (Statement stmt = connection.createStatement()) {
+            if (!PgwayConfig.DEFAULT_SCHEMA.equals(schema)) {
+                stmt.execute("CREATE SCHEMA IF NOT EXISTS " + PgIdentifiers.quote(schema));
+            }
+            // Column-Tetris aligned layout: 8-byte timestamptz, 4-byte version/execution_ms, 1-byte boolean, varlenas.
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS %s (
-                    installed_rank integer      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                    version        text,
-                    kind           text         NOT NULL CHECK (kind IN ('VERSIONED', 'REPEATABLE', 'BASELINE')),
-                    description    text         NOT NULL,
-                    script         text         NOT NULL,
-                    checksum       text         NOT NULL,
-                    installed_by   text         NOT NULL DEFAULT current_user,
-                    installed_on   timestamptz  NOT NULL DEFAULT clock_timestamp(),
-                    execution_ms   integer      NOT NULL CHECK (execution_ms >= 0),
-                    success        boolean      NOT NULL
+                    installed_on timestamptz NOT NULL DEFAULT clock_timestamp(),
+                    version      integer     PRIMARY KEY CHECK (version > 0),
+                    execution_ms integer     NOT NULL CHECK (execution_ms >= 0),
+                    success      boolean     NOT NULL,
+                    checksum     bytea       NOT NULL CHECK (octet_length(checksum) = 32),
+                    script       text        NOT NULL,
+                    installed_by text        NOT NULL DEFAULT current_user
                 )
                 """.formatted(qualified));
-            stmt.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS %s
-                    ON %s (version)
-                    WHERE version IS NOT NULL AND success
-                """.formatted(idxName, qualified));
         }
     }
 
     static List<AppliedMigration> readHistory(Connection connection, String schema, String table) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
         String sql = """
-            SELECT installed_rank, version, kind, description, script, checksum,
-                   installed_by, installed_on, execution_ms, success
+            SELECT version, installed_on, execution_ms, success, checksum, script, installed_by
             FROM %s
-            ORDER BY installed_rank ASC
+            ORDER BY version ASC
             """.formatted(qualified);
         List<AppliedMigration> result = new ArrayList<>();
         try (Statement stmt = connection.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
             while (rs.next()) {
-                String rawVersion = rs.getString("version");
-                MigrationVersion version = rawVersion != null ? MigrationVersion.parse(rawVersion) : null;
-                MigrationKind kind = MigrationKind.valueOf(rs.getString("kind"));
-                Timestamp ts = rs.getTimestamp("installed_on");
+                Timestamp ts = rs.getTimestamp(2);
                 Instant installedOn = ts != null ? ts.toInstant() : Instant.EPOCH;
                 result.add(new AppliedMigration(
-                    rs.getInt("installed_rank"),
-                    version,
-                    kind,
-                    rs.getString("description"),
-                    rs.getString("script"),
-                    rs.getString("checksum"),
-                    rs.getString("installed_by"),
+                    rs.getInt(1),
+                    rs.getString(6),
+                    HEX.formatHex(rs.getBytes(5)),
+                    rs.getString(7),
                     installedOn,
-                    rs.getInt("execution_ms"),
-                    rs.getBoolean("success")
+                    rs.getInt(3),
+                    rs.getBoolean(4)
                 ));
             }
         }
@@ -264,45 +249,45 @@ final class SchemaHistoryRepository {
             Connection connection,
             String schema,
             String table,
-            MigrationVersion version,
-            MigrationKind kind,
-            String description,
+            int version,
             String script,
-            String checksum,
+            String checksumHex,
             int executionMs,
             boolean success) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
         String sql = """
-            INSERT INTO %s (version, kind, description, script, checksum, execution_ms, success)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            RETURNING installed_rank, installed_by, installed_on
+            INSERT INTO %s (version, execution_ms, success, checksum, script)
+            VALUES (?, ?, ?, ?, ?)
+            RETURNING installed_by, installed_on
             """.formatted(qualified);
+        int clampedMs = Math.max(0, executionMs);
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, version != null ? version.value() : null);
-            ps.setString(2, kind.name());
-            ps.setString(3, description);
-            ps.setString(4, script);
-            ps.setString(5, checksum);
-            ps.setInt(6, Math.max(0, executionMs));
-            ps.setBoolean(7, success);
+            ps.setInt(1, version);
+            ps.setInt(2, clampedMs);
+            ps.setBoolean(3, success);
+            ps.setBytes(4, HEX.parseHex(checksumHex));
+            ps.setString(5, script);
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
-                int rank = rs.getInt("installed_rank");
-                String installedBy = rs.getString("installed_by");
-                Instant installedOn = rs.getTimestamp("installed_on").toInstant();
+                String installedBy = rs.getString(1);
+                Instant installedOn = rs.getTimestamp(2).toInstant();
                 return new AppliedMigration(
-                    rank,
                     version,
-                    kind,
-                    description,
                     script,
-                    checksum,
+                    checksumHex,
                     installedBy,
                     installedOn,
-                    Math.max(0, executionMs),
+                    clampedMs,
                     success
                 );
             }
+        }
+    }
+
+    static void truncateHistory(Connection connection, String schema, String table) throws SQLException {
+        String qualified = PgIdentifiers.qualifiedTable(schema, table);
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("TRUNCATE TABLE " + qualified);
         }
     }
 
@@ -313,21 +298,19 @@ final class SchemaHistoryRepository {
         }
     }
 
-    static void updateChecksumAndDescription(
+    static void updateChecksumAndScript(
             Connection connection,
             String schema,
             String table,
-            int installedRank,
-            String checksum,
-            String description,
+            int version,
+            String checksumHex,
             String script) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
-        String sql = "UPDATE " + qualified + " SET checksum = ?, description = ?, script = ? WHERE installed_rank = ?";
+        String sql = "UPDATE " + qualified + " SET checksum = ?, script = ? WHERE version = ?";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, checksum);
-            ps.setString(2, description);
-            ps.setString(3, script);
-            ps.setInt(4, installedRank);
+            ps.setBytes(1, HEX.parseHex(checksumHex));
+            ps.setString(2, script);
+            ps.setInt(3, version);
             ps.executeUpdate();
         }
     }

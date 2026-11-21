@@ -26,30 +26,28 @@ public final class PgwayMigrationInitializer implements InitializingBean, Ordere
     public void afterPropertiesSet() {
         MigrationResult result = pgway.migrate();
         String schema = pgway.config().schema();
-        if (result.baselined()) {
-            log.info("Pgway baselined schema '{}' at version {}", schema, result.currentVersion());
-        }
+        String versionLabel = result.currentVersion() > 0 ? "V" + result.currentVersion() : "none";
         if (result.appliedCount() == 0) {
             log.info(
-                "Pgway schema '{}' is up to date (version {}, {} ms)",
+                "Pgway schema '{}' is up to date ({}, {} ms)",
                 schema,
-                result.currentVersion() != null ? result.currentVersion() : "none",
+                versionLabel,
                 result.totalDuration().toMillis()
             );
         } else {
             for (AppliedMigration applied : result.applied()) {
                 log.info(
-                    "Pgway applied {} ({}, {} ms)",
+                    "Pgway applied {} (V{}, {} ms)",
                     applied.script(),
-                    applied.version() != null ? "V" + applied.version() : "R",
+                    applied.version(),
                     applied.executionMs()
                 );
             }
             log.info(
-                "Pgway applied {} migration(s) to schema '{}' (now at version {}, {} ms total)",
+                "Pgway applied {} migration(s) to schema '{}' (now at {}, {} ms total)",
                 result.appliedCount(),
                 schema,
-                result.currentVersion() != null ? result.currentVersion() : "none",
+                versionLabel,
                 result.totalDuration().toMillis()
             );
         }

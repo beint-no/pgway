@@ -3,6 +3,7 @@ package no.beint.pgway.gradle;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -10,6 +11,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Disposable, loopback-only PostgreSQL 19+ cluster for build-time migration verification. */
 final class DisposablePostgresCluster implements AutoCloseable {
@@ -41,7 +43,8 @@ final class DisposablePostgresCluster implements AutoCloseable {
                     "--auth=scram-sha-256",
                     "--pwfile=" + pwFile,
                     "--encoding=UTF8",
-                    "--locale=C"
+                    "--locale=C",
+                    "--no-sync"
                 );
             } finally {
                 Files.deleteIfExists(pwFile);
@@ -91,9 +94,14 @@ final class DisposablePostgresCluster implements AutoCloseable {
                     "-h 127.0.0.1 -p " + port
                         + " -c unix_socket_directories=''"
                         + " -c max_connections=20"
+                        + " -c shared_buffers=16MB"
                         + " -c fsync=off"
                         + " -c full_page_writes=off"
-                        + " -c synchronous_commit=off",
+                        + " -c synchronous_commit=off"
+                        + " -c autovacuum=off"
+                        + " -c max_wal_senders=0"
+                        + " -c wal_level=minimal"
+                        + " -c logging_collector=off",
                     "-w",
                     "start"
                 );
@@ -112,14 +120,25 @@ final class DisposablePostgresCluster implements AutoCloseable {
         cmd[0] = executable;
         System.arraycopy(args, 0, cmd, 1, args.length);
         Process process = new ProcessBuilder(cmd).redirectErrorStream(true).start();
-        String output;
-        try (var stream = process.getInputStream()) {
-            output = new String(stream.readAllBytes());
-        }
-        if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+
+        // Drain stdout/stderr on a virtual thread so waitFor(timeout) enforces a real deadline even if a process hangs.
+        AtomicReference<String> outputRef = new AtomicReference<>("");
+        Thread drainer = Thread.ofVirtual().start(() -> {
+            try (var stream = process.getInputStream()) {
+                outputRef.set(new String(stream.readAllBytes(), StandardCharsets.UTF_8));
+            } catch (IOException _) {
+                // Stream closed on forcible destroy
+            }
+        });
+
+        boolean finished = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        if (!finished) {
             process.destroyForcibly();
-            throw new IOException("Timed out running " + executable + ": " + output);
+            drainer.join(Duration.ofSeconds(2));
+            throw new IOException("Timed out running " + executable + ": " + outputRef.get());
         }
+        drainer.join();
+        String output = outputRef.get();
         if (process.exitValue() != 0) {
             throw new IOException("Command failed (" + process.exitValue() + "): " + executable + "\n" + output);
         }

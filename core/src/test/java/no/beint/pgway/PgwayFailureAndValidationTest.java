@@ -35,29 +35,25 @@ class PgwayFailureAndValidationTest {
 
         PgwayMigrationException ex = assertThrows(PgwayMigrationException.class, pgwayBroken::migrate);
         assertEquals("V2__concurrent_broken.sql", ex.script());
+        assertEquals(2, ex.version());
         assertEquals(2, ex.statementIndex());
         assertEquals(3, ex.line());
 
-        // Validate must report FAILED_MIGRATION_IN_HISTORY
         ValidationResult validation = pgwayBroken.validate();
         assertFalse(validation.valid());
         assertTrue(validation.issues().stream().anyMatch(i -> i.code() == ValidationErrorCode.FAILED_MIGRATION_IN_HISTORY));
 
-        // Info must report FAILED for V2
         var info = pgwayBroken.info();
         assertEquals(MigrationState.APPLIED, info.get(0).state());
         assertEquals(MigrationState.FAILED, info.get(1).state());
 
-        // Subsequent migrate refuses to proceed until repaired!
         PgwayValidationException blocked = assertThrows(PgwayValidationException.class, pgwayBroken::migrate);
         assertTrue(blocked.issues().stream().anyMatch(i -> i.code() == ValidationErrorCode.FAILED_MIGRATION_IN_HISTORY));
 
-        // Repair removes failed row
         RepairResult repair = pgwayBroken.repair();
         assertEquals(1, repair.failedRowsRemoved());
         assertEquals(0, repair.checksumsRealigned());
 
-        // Now fix script (using IF NOT EXISTS for the already-committed first statement) and re-run
         Pgway pgwayFixed = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
             .source(InMemoryMigrationSource.ofStrings(Map.of(
@@ -88,7 +84,6 @@ class PgwayFailureAndValidationTest {
             .create();
         initial.migrate();
 
-        // Mutate V1 and drop V2 -> both CHECKSUM_MISMATCH and MISSING_MIGRATION reported
         Pgway drifted = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
             .source(InMemoryMigrationSource.ofStrings(Map.of(
@@ -106,7 +101,6 @@ class PgwayFailureAndValidationTest {
         assertEquals(MigrationState.CHECKSUM_MISMATCH, info.get(0).state());
         assertEquals(MigrationState.MISSING, info.get(1).state());
 
-        // Restore V2 and realign V1 checksum with repair(true)
         Pgway realign = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
             .source(InMemoryMigrationSource.ofStrings(Map.of(
@@ -149,67 +143,48 @@ class PgwayFailureAndValidationTest {
     }
 
     @Test
-    void supportsExplicitBaselineAndBaselineOnMigrate() throws Exception {
+    void compactHistorySeedsExistingDatabaseAndSquashesOldHistoryToSingleV1() throws Exception {
         Pg19TestCluster pg = Pg19TestCluster.shared();
-        String db = pg.createDatabase("baseline_existing");
+        String db = pg.createDatabase("compact_history");
 
-        // Pre-existing table in schema
-        try (Connection c = pg.connect(db); Statement s = c.createStatement()) {
-            s.execute("CREATE TABLE legacy_table (id int PRIMARY KEY)");
-        }
-
-        Pgway pgway = Pgway.configure()
+        // Start with V1, V2, V3 applied
+        Pgway beforeSquash = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .baselineOnMigrate(true)
-            .baselineVersion("2")
             .source(InMemoryMigrationSource.ofStrings(Map.of(
-                "V1__old.sql", "CREATE TABLE should_not_run_1 (id int);",
-                "V2__old.sql", "CREATE TABLE should_not_run_2 (id int);",
-                "V3__new.sql", "CREATE TABLE should_run_3 (id int);"
+                "V1__t1.sql", "CREATE TABLE t1 (id int PRIMARY KEY);",
+                "V2__t2.sql", "ALTER TABLE t1 ADD COLUMN name text;",
+                "V3__t3.sql", "CREATE TABLE t2 (id int PRIMARY KEY);"
+            )))
+            .create();
+        assertEquals(3, beforeSquash.migrate().appliedCount());
+
+        // Squash into a single compacted V1 + a new V2
+        Pgway afterSquash = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
+                "V1__app_schema.sql", """
+                    CREATE TABLE t1 (id int PRIMARY KEY, name text);
+                    CREATE TABLE t2 (id int PRIMARY KEY);
+                    """,
+                "V2__after_squash.sql", "CREATE TABLE t3 (id int PRIMARY KEY);"
             )))
             .create();
 
-        MigrationResult res = pgway.migrate();
-        assertTrue(res.baselined());
-        assertEquals(1, res.appliedCount());
-        assertEquals(MigrationVersion.parse("3"), res.applied().get(0).version());
+        AppliedMigration compacted = afterSquash.compactHistory();
+        assertEquals(1, compacted.version());
+        assertEquals("V1__app_schema.sql", compacted.script());
 
-        // Verify V1 and V2 did not run and show as BELOW_BASELINE in info()
+        // Verify pgway_history now has exactly 1 row (V1), and migrate() applies only V2
         try (Connection c = pg.connect(db); Statement s = c.createStatement();
-             ResultSet rs = s.executeQuery("SELECT to_regclass('public.should_not_run_1'), to_regclass('public.should_run_3')")) {
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM pgway_history")) {
             assertTrue(rs.next());
-            assertEquals(null, rs.getString(1));
-            assertEquals("should_run_3", rs.getString(2));
+            assertEquals(1, rs.getInt(1));
         }
 
-        var info = pgway.info();
-        assertTrue(info.stream().anyMatch(i -> i.state() == MigrationState.BASELINE));
-        assertTrue(info.stream().anyMatch(i -> i.state() == MigrationState.BELOW_BASELINE));
-        assertTrue(pgway.validate().valid());
-
-        // Calling baseline() again when history is non-empty fails cleanly
-        assertThrows(PgwayValidationException.class, () -> pgway.baseline("5"));
-    }
-
-    @Test
-    void baselineOnMigrateDoesNotBaselineBrandNewEmptySchema() throws Exception {
-        Pg19TestCluster pg = Pg19TestCluster.shared();
-        String db = pg.createDatabase("baseline_empty");
-
-        Pgway pgway = Pgway.configure()
-            .dataSource(pg.url(db), pg.user(), pg.password())
-            .baselineOnMigrate(true)
-            .baselineVersion("2")
-            .source(InMemoryMigrationSource.ofStrings(Map.of(
-                "V1__one.sql", "CREATE TABLE from_v1 (id int PRIMARY KEY);",
-                "V2__two.sql", "CREATE TABLE from_v2 (id int PRIMARY KEY);",
-                "V3__three.sql", "CREATE TABLE from_v3 (id int PRIMARY KEY);"
-            )))
-            .create();
-
-        MigrationResult res = pgway.migrate();
-        assertFalse(res.baselined(), "Empty schema must migrate from V1 rather than baseline");
-        assertEquals(3, res.appliedCount());
-        assertTrue(pgway.validate().valid());
+        MigrationResult res = afterSquash.migrate();
+        assertEquals(1, res.appliedCount());
+        assertEquals(2, res.applied().get(0).version());
+        assertEquals(2, res.currentVersion());
+        assertTrue(afterSquash.validate().valid());
     }
 }

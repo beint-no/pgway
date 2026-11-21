@@ -4,11 +4,8 @@ package no.beint.pgway;
 public enum MigrationState {
     APPLIED,
     PENDING,
-    OUTDATED,
     FAILED,
     MISSING,
     CHECKSUM_MISMATCH,
-    OUT_OF_ORDER,
-    BASELINE,
-    BELOW_BASELINE
+    OUT_OF_ORDER
 }

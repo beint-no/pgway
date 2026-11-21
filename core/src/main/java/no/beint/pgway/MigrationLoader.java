@@ -17,19 +17,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Loads, strictly decodes, validates filenames, computes SHA-256 checksums, parses directives/SQL,
- * and sorts all migrations from configured {@link MigrationSource}s.
+ * Loads, strictly decodes, validates filenames ({@code V<positive-int>__<description>.sql}),
+ * computes SHA-256 checksums, parses directives/SQL, and sorts migrations.
  */
 final class MigrationLoader {
-    private static final Pattern VERSIONED_PATTERN = Pattern.compile("^V([0-9]+(?:[._][0-9]+)*)__(.+)\\.sql$");
-    private static final Pattern REPEATABLE_PATTERN = Pattern.compile("^R__(.+)\\.sql$");
+    private static final Pattern VERSIONED_PATTERN = Pattern.compile("^V([1-9][0-9]*)__(.+)\\.sql$");
 
     private MigrationLoader() {}
 
-    record LoadedMigrations(
-            List<MigrationScript> versioned,
-            List<MigrationScript> repeatable,
-            List<ValidationIssue> issues) {}
+    record LoadedMigrations(List<MigrationScript> scripts, List<ValidationIssue> issues) {}
 
     static LoadedMigrations load(List<MigrationSource> sources) {
         List<RawMigrationResource> rawResources = new ArrayList<>();
@@ -41,12 +37,9 @@ final class MigrationLoader {
             }
         }
 
-        List<MigrationScript> versioned = new ArrayList<>();
-        List<MigrationScript> repeatable = new ArrayList<>();
+        List<MigrationScript> scripts = new ArrayList<>(rawResources.size());
         List<ValidationIssue> issues = new ArrayList<>();
-
-        Map<MigrationVersion, String> seenVersions = new HashMap<>();
-        Map<String, String> seenRepeatables = new HashMap<>();
+        Map<Integer, String> seenVersions = new HashMap<>();
 
         for (RawMigrationResource resource : rawResources) {
             String fullName = resource.name();
@@ -55,42 +48,32 @@ final class MigrationLoader {
                 continue;
             }
 
-            Matcher versionedMatcher = VERSIONED_PATTERN.matcher(fileName);
-            Matcher repeatableMatcher = REPEATABLE_PATTERN.matcher(fileName);
-
-            MigrationKind kind;
-            MigrationVersion version;
-            String rawDescription;
-            if (versionedMatcher.matches()) {
-                kind = MigrationKind.VERSIONED;
-                try {
-                    version = MigrationVersion.parse(versionedMatcher.group(1));
-                } catch (IllegalArgumentException e) {
-                    issues.add(new ValidationIssue(
-                        ValidationErrorCode.INVALID_FILENAME,
-                        fullName,
-                        null,
-                        "Invalid version in migration filename '" + fullName + "': " + e.getMessage()
-                    ));
-                    continue;
-                }
-                rawDescription = versionedMatcher.group(2);
-            } else if (repeatableMatcher.matches()) {
-                kind = MigrationKind.REPEATABLE;
-                version = null;
-                rawDescription = repeatableMatcher.group(1);
-            } else {
+            Matcher matcher = VERSIONED_PATTERN.matcher(fileName);
+            if (!matcher.matches()) {
                 issues.add(new ValidationIssue(
                     ValidationErrorCode.INVALID_FILENAME,
                     fullName,
-                    null,
+                    0,
                     "Invalid migration filename '" + fullName
-                        + "': expected V<version>__<description>.sql or R__<description>.sql"
+                        + "': expected V<version>__<description>.sql (positive integer without leading zeros, e.g. V1__init.sql)"
                 ));
                 continue;
             }
 
-            String description = rawDescription.replace('_', ' ').trim();
+            int version;
+            try {
+                version = Integer.parseInt(matcher.group(1));
+            } catch (NumberFormatException _) {
+                issues.add(new ValidationIssue(
+                    ValidationErrorCode.INVALID_FILENAME,
+                    fullName,
+                    0,
+                    "Migration version overflows 32-bit integer in '" + fullName + "'"
+                ));
+                continue;
+            }
+
+            String description = matcher.group(2).replace('_', ' ').trim();
             if (description.isEmpty()) {
                 issues.add(new ValidationIssue(
                     ValidationErrorCode.INVALID_FILENAME,
@@ -101,9 +84,10 @@ final class MigrationLoader {
                 continue;
             }
 
+            byte[] rawBytes = resource.bytes();
             String decoded;
             try {
-                decoded = decodeStrictUtf8(resource.bytes());
+                decoded = decodeStrictUtf8(rawBytes);
             } catch (CharacterCodingException e) {
                 issues.add(new ValidationIssue(
                     ValidationErrorCode.INVALID_UTF8,
@@ -115,7 +99,10 @@ final class MigrationLoader {
             }
 
             String normalizedSql = SqlScriptParser.normalizeSql(decoded);
-            String checksum = sha256Hex(normalizedSql);
+            // Zero-copy fast path: hash raw UTF-8 bytes directly when no BOM or CR normalization occurred.
+            String checksum = normalizedSql == decoded
+                ? sha256Hex(rawBytes)
+                : sha256Hex(normalizedSql);
 
             SqlScriptParser.ParsedScript parsed;
             try {
@@ -130,64 +117,50 @@ final class MigrationLoader {
                 continue;
             }
 
-            if (kind == MigrationKind.VERSIONED) {
-                String previous = seenVersions.putIfAbsent(version, fullName);
-                if (previous != null) {
-                    issues.add(new ValidationIssue(
-                        ValidationErrorCode.DUPLICATE_VERSION,
-                        fullName,
-                        version,
-                        "Duplicate migration version " + version + ": '" + previous + "' and '" + fullName + "'"
-                    ));
-                    continue;
-                }
-                versioned.add(new MigrationScript(
-                    kind,
+            String previous = seenVersions.putIfAbsent(version, fullName);
+            if (previous != null) {
+                issues.add(new ValidationIssue(
+                    ValidationErrorCode.DUPLICATE_VERSION,
+                    fullName,
                     version,
-                    description,
-                    fullName,
-                    resource.location(),
-                    normalizedSql,
-                    checksum,
-                    parsed.directives(),
-                    parsed.statements()
+                    "Duplicate migration version V" + version + ": '" + previous + "' and '" + fullName + "'"
                 ));
-            } else {
-                String previous = seenRepeatables.putIfAbsent(fullName, resource.location());
-                if (previous != null) {
-                    issues.add(new ValidationIssue(
-                        ValidationErrorCode.DUPLICATE_REPEATABLE,
-                        fullName,
-                        null,
-                        "Duplicate repeatable migration '" + fullName + "' found in " + previous + " and " + resource.location()
-                    ));
-                    continue;
-                }
-                repeatable.add(new MigrationScript(
-                    kind,
-                    null,
-                    description,
-                    fullName,
-                    resource.location(),
-                    normalizedSql,
-                    checksum,
-                    parsed.directives(),
-                    parsed.statements()
-                ));
+                continue;
             }
+
+            scripts.add(new MigrationScript(
+                version,
+                description,
+                fullName,
+                resource.location(),
+                normalizedSql,
+                checksum,
+                parsed.directives(),
+                parsed.statements()
+            ));
         }
 
-        versioned.sort(Comparator.comparing(MigrationScript::version));
-        repeatable.sort(Comparator.comparing(MigrationScript::description).thenComparing(MigrationScript::scriptName));
+        scripts.sort(Comparator.comparingInt(MigrationScript::version));
+        return new LoadedMigrations(List.copyOf(scripts), List.copyOf(issues));
+    }
 
-        return new LoadedMigrations(List.copyOf(versioned), List.copyOf(repeatable), List.copyOf(issues));
+    static String descriptionFromScriptName(String scriptName) {
+        String fileName = baseName(scriptName);
+        Matcher matcher = VERSIONED_PATTERN.matcher(fileName);
+        if (matcher.matches()) {
+            return matcher.group(2).replace('_', ' ').trim();
+        }
+        return fileName;
     }
 
     static String sha256Hex(String normalizedSql) {
+        return sha256Hex(normalizedSql.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String sha256Hex(byte[] bytes) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(normalizedSql.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest);
+            return HexFormat.of().formatHex(md.digest(bytes));
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError("SHA-256 missing from JDK", e);
         }

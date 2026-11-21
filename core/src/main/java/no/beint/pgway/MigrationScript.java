@@ -3,10 +3,9 @@ package no.beint.pgway;
 import java.util.List;
 import java.util.Objects;
 
-/** Parsed migration script ready for validation or execution. */
+/** Parsed versioned migration script ready for validation or execution. */
 public record MigrationScript(
-        MigrationKind kind,
-        MigrationVersion version,
+        int version,
         String description,
         String scriptName,
         String location,
@@ -16,12 +15,8 @@ public record MigrationScript(
         List<SqlStatement> statements) {
 
     public MigrationScript {
-        Objects.requireNonNull(kind, "kind must not be null");
-        if (kind == MigrationKind.VERSIONED && version == null) {
-            throw new IllegalArgumentException("Versioned migration requires a non-null version");
-        }
-        if (kind == MigrationKind.REPEATABLE && version != null) {
-            throw new IllegalArgumentException("Repeatable migration must not have a version");
+        if (version <= 0) {
+            throw new IllegalArgumentException("version must be positive: " + version);
         }
         Objects.requireNonNull(description, "description must not be null");
         Objects.requireNonNull(scriptName, "scriptName must not be null");

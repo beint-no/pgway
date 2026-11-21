@@ -21,13 +21,11 @@ class MigrationLoaderTest {
 
     @Test
     void enforcesPostgres19OrHigher() {
-        // PG 19 and future majors accepted
         SchemaHistoryRepository.validateServerVersion(190000, "PostgreSQL 19.0");
         SchemaHistoryRepository.validateServerVersion(190005, "PostgreSQL 19.5");
         SchemaHistoryRepository.validateServerVersion(200000, "PostgreSQL 20.0");
         SchemaHistoryRepository.validateServerVersion(250003, "PostgreSQL 25.3");
 
-        // PG < 19 rejected
         assertThrows(
             PgwayUnsupportedDatabaseException.class,
             () -> SchemaHistoryRepository.validateServerVersion(189999, "PostgreSQL 18.99")
@@ -48,31 +46,30 @@ class MigrationLoaderTest {
         Files.writeString(tempDir.resolve("V2__second.sql"), "SELECT 2;");
         Files.writeString(tempDir.resolve("V10__tenth.sql"), "SELECT 10;");
         Files.writeString(tempDir.resolve("V1__first.sql"), "SELECT 1;");
-        Files.writeString(tempDir.resolve("R__refresh_views.sql"), "SELECT 99;");
 
         var loaded = MigrationLoader.load(List.of(new FilesystemMigrationSource(tempDir)));
         assertTrue(loaded.issues().isEmpty());
-        assertEquals(3, loaded.versioned().size());
-        assertEquals("1", loaded.versioned().get(0).version().value());
-        assertEquals("2", loaded.versioned().get(1).version().value());
-        assertEquals("10", loaded.versioned().get(2).version().value());
-        assertEquals("first", loaded.versioned().get(0).description());
-        assertEquals(1, loaded.repeatable().size());
-        assertEquals("refresh views", loaded.repeatable().get(0).description());
+        assertEquals(3, loaded.scripts().size());
+        assertEquals(1, loaded.scripts().get(0).version());
+        assertEquals(2, loaded.scripts().get(1).version());
+        assertEquals(10, loaded.scripts().get(2).version());
+        assertEquals("first", loaded.scripts().get(0).description());
     }
 
     @Test
-    void rejectsInvalidSqlFilenamesAndDuplicateVersions() {
+    void rejectsInvalidFilenamesLeadingZerosNonIntegerVersionsAndDuplicates() {
         var loaded = MigrationLoader.load(List.of(InMemoryMigrationSource.ofStrings(Map.of(
             "V1__a.sql", "SELECT 1;",
-            "V01__b.sql", "SELECT 1;",
-            "V1.0__c.sql", "SELECT 1;",
+            "sub/V1__dup.sql", "SELECT 1;",
+            "V01__leading_zero.sql", "SELECT 1;",
+            "V1.0__dotted.sql", "SELECT 1;",
+            "R__repeatable_not_supported.sql", "SELECT 1;",
             "bad_migration.sql", "SELECT 1;",
             "V2_single_underscore.sql", "SELECT 2;"
         ))));
         assertFalse(loaded.issues().isEmpty());
         assertTrue(loaded.issues().stream().anyMatch(i -> i.code() == ValidationErrorCode.DUPLICATE_VERSION));
-        assertTrue(loaded.issues().stream().anyMatch(i -> i.code() == ValidationErrorCode.INVALID_FILENAME));
+        assertEquals(5, loaded.issues().stream().filter(i -> i.code() == ValidationErrorCode.INVALID_FILENAME).count());
     }
 
     @Test
@@ -83,10 +80,9 @@ class MigrationLoaderTest {
         var crlfWithBom = MigrationLoader.load(List.of(InMemoryMigrationSource.ofStrings(Map.of(
             "V1__init.sql", "\uFEFFCREATE TABLE t (id int);\r\n"
         ))));
-        assertEquals(lf.versioned().get(0).checksum(), crlfWithBom.versioned().get(0).checksum());
-        assertEquals(64, lf.versioned().get(0).checksum().length());
+        assertEquals(lf.scripts().get(0).checksum(), crlfWithBom.scripts().get(0).checksum());
+        assertEquals(64, lf.scripts().get(0).checksum().length());
 
-        // Malformed UTF-8 sequence must fail fast
         var invalidUtf8 = MigrationLoader.load(List.of(InMemoryMigrationSource.ofBytes(Map.of(
             "V1__bad_utf8.sql", new byte[] {(byte) 0xFF, (byte) 0xFE, 0x41}
         ))));
@@ -115,12 +111,11 @@ class MigrationLoaderTest {
             var source = new ClasspathMigrationSource("db/migration", loader);
             var loaded = MigrationLoader.load(List.of(source));
             assertTrue(loaded.issues().isEmpty());
-            assertEquals(2, loaded.versioned().size());
-            assertEquals("V1__from_jar.sql", loaded.versioned().get(0).scriptName());
-            assertEquals("sub/V2__nested.sql", loaded.versioned().get(1).scriptName());
+            assertEquals(2, loaded.scripts().size());
+            assertEquals("V1__from_jar.sql", loaded.scripts().get(0).scriptName());
+            assertEquals("sub/V2__nested.sql", loaded.scripts().get(1).scriptName());
         }
 
-        // Also verify JAR archives without explicit directory entries
         Path strippedJar = tempDir.resolve("stripped.jar");
         try (JarOutputStream jos = new JarOutputStream(Files.newOutputStream(strippedJar))) {
             jos.putNextEntry(new JarEntry("db/migration/V1__no_dir_entry.sql"));
@@ -131,8 +126,8 @@ class MigrationLoaderTest {
             var source = new ClasspathMigrationSource("db/migration", loader);
             var loaded = MigrationLoader.load(List.of(source));
             assertTrue(loaded.issues().isEmpty());
-            assertEquals(1, loaded.versioned().size());
-            assertEquals("V1__no_dir_entry.sql", loaded.versioned().get(0).scriptName());
+            assertEquals(1, loaded.scripts().size());
+            assertEquals("V1__no_dir_entry.sql", loaded.scripts().get(0).scriptName());
         }
     }
 }

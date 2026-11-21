@@ -92,44 +92,12 @@ class PgwaySpringBootIntegrationTest {
             assertTrue(ctx.getStartupFailure() == null, () -> "Startup failed: " + ctx.getStartupFailure());
             JdbcTemplate jdbc = ctx.getBean(JdbcTemplate.class);
             Integer count = jdbc.queryForObject(
-                "SELECT count(*) FROM utin.pgway_schema_history WHERE success",
+                "SELECT count(*) FROM utin.pgway_history WHERE success",
                 Integer.class
             );
             assertEquals(2, count);
             String name = jdbc.queryForObject("SELECT name FROM utin.spring_customers WHERE id = 1", String.class);
             assertEquals("Respiro", name);
-        });
-    }
-
-    @Test
-    void baselinesPreExistingDatabaseWithBaselineOnMigrate() throws Exception {
-        Pg19TestCluster pg = Pg19TestCluster.shared();
-        String db = pg.createDatabase("spring_baseline");
-        try (var conn = pg.connect(db); var stmt = conn.createStatement()) {
-            stmt.execute("CREATE TABLE spring_customers (id integer PRIMARY KEY, name text NOT NULL)");
-            stmt.execute("INSERT INTO spring_customers (id, name) VALUES (1, 'Existing')");
-        }
-
-        ApplicationContextRunner runner = new ApplicationContextRunner()
-            .withConfiguration(AutoConfigurations.of(
-                DataSourceAutoConfiguration.class,
-                PgwayAutoConfiguration.class,
-                JdbcTemplateAutoConfiguration.class
-            ))
-            .withPropertyValues(
-                "spring.datasource.url=" + pg.url(db),
-                "spring.datasource.username=" + pg.user(),
-                "spring.datasource.password=" + pg.password(),
-                "pgway.baseline-on-migrate=true"
-            );
-
-        runner.run(ctx -> {
-            assertTrue(ctx.getStartupFailure() == null, () -> "Startup failed: " + ctx.getStartupFailure());
-            JdbcTemplate jdbc = ctx.getBean(JdbcTemplate.class);
-            // V1 baselined (not re-run), V2 applied!
-            Integer count = jdbc.queryForObject("SELECT count(*) FROM pgway_schema_history", Integer.class);
-            assertEquals(2, count);
-            assertEquals("Existing", jdbc.queryForObject("SELECT name FROM spring_customers WHERE id = 1", String.class));
         });
     }
 
@@ -151,7 +119,6 @@ class PgwaySpringBootIntegrationTest {
                 assertFalse(ctx.containsBean("pgway"));
             });
 
-        // No DataSource bean -> backs off cleanly without needing spring.autoconfigure.exclude
         new ApplicationContextRunner()
             .withConfiguration(AutoConfigurations.of(PgwayAutoConfiguration.class))
             .run(ctx -> {

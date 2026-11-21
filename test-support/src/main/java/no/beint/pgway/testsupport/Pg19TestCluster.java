@@ -75,7 +75,8 @@ public final class Pg19TestCluster implements AutoCloseable {
                     "--auth=scram-sha-256",
                     "--pwfile=" + pwFile,
                     "--encoding=UTF8",
-                    "--locale=C"
+                    "--locale=C",
+                    "--no-sync"
                 );
             } finally {
                 Files.deleteIfExists(pwFile);
