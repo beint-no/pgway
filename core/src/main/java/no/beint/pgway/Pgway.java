@@ -59,6 +59,15 @@ public final class Pgway {
         return validateSource(new FilesystemMigrationSource(directory));
     }
 
+    /**
+     * Computes the deterministic SHA-256 chain checksum over applied history rows,
+     * matching the {@code -- pgway: replaces=V<n>:<sha256>} compaction directive format.
+     */
+    public static String historyChainChecksum(List<AppliedMigration> history) {
+        Objects.requireNonNull(history, "history must not be null");
+        return MigrationLoader.historyChainChecksum(history);
+    }
+
     public PgwayConfig config() {
         return config;
     }
@@ -108,7 +117,8 @@ public final class Pgway {
                                 List.of(),
                                 loaded.scripts().size(),
                                 index.highestVersion(),
-                                totalDuration
+                                totalDuration,
+                                0
                             );
                         }
                     }
@@ -155,6 +165,34 @@ public final class Pgway {
                     PgwayConfig.HISTORY_TABLE
                 );
 
+                int compactedFromVersion = 0;
+                ReplacesHistory matchedReplaces = findMatchingReplaces(loaded.scripts(), history);
+                if (matchedReplaces != null) {
+                    MigrationLoader.DiscoveredMigration v1 = loaded.scripts().getFirst();
+                    connection.setAutoCommit(false);
+                    try {
+                        SchemaHistoryRepository.truncateHistory(connection, config.schema(), PgwayConfig.HISTORY_TABLE);
+                        AppliedMigration compactedRow = SchemaHistoryRepository.insertHistoryRow(
+                            connection,
+                            config.schema(),
+                            PgwayConfig.HISTORY_TABLE,
+                            v1.version(),
+                            v1.scriptName(),
+                            v1.checksum(),
+                            0,
+                            true
+                        );
+                        connection.commit();
+                        history = List.of(compactedRow);
+                        compactedFromVersion = matchedReplaces.throughVersion();
+                    } catch (SQLException e) {
+                        rollbackQuietly(connection, e);
+                        throw e;
+                    } finally {
+                        connection.setAutoCommit(true);
+                    }
+                }
+
                 List<ValidationIssue> issues = validateAgainstHistory(loaded.scripts(), history);
                 if (!issues.isEmpty()) {
                     throw new PgwayValidationException(issues);
@@ -199,7 +237,7 @@ public final class Pgway {
                 }
 
                 Duration totalDuration = Duration.ofNanos(System.nanoTime() - startNanos);
-                return new MigrationResult(newlyApplied, skipped, currentVersion, totalDuration);
+                return new MigrationResult(newlyApplied, skipped, currentVersion, totalDuration, compactedFromVersion);
             } catch (Throwable t) {
                 primaryError = t;
                 throw t;
@@ -292,7 +330,9 @@ public final class Pgway {
                     config.schema(),
                     PgwayConfig.HISTORY_TABLE
                 );
-                issues.addAll(validateAgainstHistory(headers.scripts(), history));
+                if (findMatchingReplaces(headers.scripts(), history) == null) {
+                    issues.addAll(validateAgainstHistory(headers.scripts(), history));
+                }
             } else if (SchemaHistoryRepository.schemaHasUserObjects(connection, config.schema())) {
                 issues.add(nonEmptySchemaIssue());
             }
@@ -640,6 +680,59 @@ public final class Pgway {
             msg.toString(),
             cause
         );
+    }
+
+    /**
+     * Checks whether an existing {@code pgway_history} matches the cryptographic
+     * {@code -- pgway: replaces=V<n>:<chain-sha256>} directive on {@code V1}.
+     * Returns the matched directive only when every row in {@code history} succeeded,
+     * the highest applied version equals {@code replaces.throughVersion()}, and the
+     * history chain SHA-256 matches bit-for-bit.
+     */
+    private static ReplacesHistory findMatchingReplaces(
+            List<MigrationLoader.DiscoveredMigration> scripts,
+            List<AppliedMigration> history) {
+        if (history.isEmpty() || scripts.isEmpty()) {
+            return null;
+        }
+        MigrationLoader.DiscoveredMigration v1 = scripts.getFirst();
+        if (v1.version() != 1) {
+            return null;
+        }
+        // If history already matches V1, no compaction is needed.
+        if (history.getFirst().version() == 1
+                && history.getFirst().success()
+                && history.getFirst().checksum().equals(v1.checksum())) {
+            return null;
+        }
+        // Quick scan before full parse: only parse V1 if it actually contains a pgway directive header.
+        if (!v1.normalizedSql().contains("pgway:")) {
+            return null;
+        }
+        MigrationScript parsedV1;
+        try {
+            parsedV1 = v1.parse();
+        } catch (PgwaySqlParseException _) {
+            return null;
+        }
+        ReplacesHistory replaces = parsedV1.directives().replaces();
+        if (replaces == null) {
+            return null;
+        }
+        int maxVersion = 0;
+        for (AppliedMigration row : history) {
+            if (!row.success()) {
+                return null;
+            }
+            if (row.version() > maxVersion) {
+                maxVersion = row.version();
+            }
+        }
+        if (maxVersion != replaces.throughVersion()) {
+            return null;
+        }
+        String actualChain = MigrationLoader.historyChainChecksum(history);
+        return actualChain.equals(replaces.chainChecksum()) ? replaces : null;
     }
 
     private record HistoryIndex(Map<Integer, AppliedMigration> appliedByVersion, int highestVersion) {}

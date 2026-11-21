@@ -28,6 +28,18 @@ public final class PgwayPlugin implements Plugin<Project> {
             }
         );
 
+        project.getTasks().register(
+            "compactPgwayMigrations",
+            CompactPgwayMigrationsTask.class,
+            task -> {
+                task.setGroup("pgway");
+                task.setDescription("Compacts V1..Vn SQL migrations into a single verified V1 schema with seamless history compaction.");
+                task.getMigrationsDir().set(project.getLayout().getProjectDirectory().dir("src/main/resources/db/migration"));
+                task.getSchema().set(extension.getSchema());
+                task.getPostgresBin().set(extension.getPostgresBin());
+            }
+        );
+
         project.getTasks().matching(t -> t.getName().equals("check") || t.getName().equals("processResources"))
             .configureEach(t -> t.dependsOn(verifyTask));
     }

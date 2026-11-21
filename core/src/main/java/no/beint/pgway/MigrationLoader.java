@@ -35,6 +35,13 @@ final class MigrationLoader {
 
         MigrationScript parse() {
             SqlScriptParser.ParsedScript parsed = SqlScriptParser.parse(scriptName, normalizedSql);
+            if (parsed.directives().replaces() != null && version != 1) {
+                throw new PgwaySqlParseException(
+                    scriptName,
+                    1,
+                    "Pgway directive 'replaces' is only allowed on V1 migrations (found on V" + version + ")"
+                );
+            }
             return new MigrationScript(
                 version,
                 description,
@@ -180,6 +187,16 @@ final class MigrationLoader {
             return matcher.group(2).replace('_', ' ').trim();
         }
         return fileName;
+    }
+
+    static String historyChainChecksum(List<AppliedMigration> history) {
+        StringBuilder sb = new StringBuilder(history.size() * 72);
+        List<AppliedMigration> sorted = new ArrayList<>(history);
+        sorted.sort(Comparator.comparingInt(AppliedMigration::version));
+        for (AppliedMigration row : sorted) {
+            sb.append('V').append(row.version()).append(':').append(row.checksum()).append('\n');
+        }
+        return sha256Hex(sb.toString());
     }
 
     static String sha256Hex(String normalizedSql) {

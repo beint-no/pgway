@@ -69,7 +69,11 @@ final class DisposablePostgresCluster implements AutoCloseable {
     }
 
     String url() {
-        return "jdbc:postgresql://127.0.0.1:" + port + "/postgres";
+        return url("postgres");
+    }
+
+    String url(String database) {
+        return "jdbc:postgresql://127.0.0.1:" + port + "/" + database;
     }
 
     String user() {
@@ -81,8 +85,12 @@ final class DisposablePostgresCluster implements AutoCloseable {
     }
 
     DataSource dataSource() {
+        return dataSource("postgres");
+    }
+
+    DataSource dataSource(String database) {
         Driver driver = new Driver();
-        String jdbcUrl = url();
+        String jdbcUrl = url(database);
         return new DataSource() {
             private PrintWriter logWriter;
             private int loginTimeout;
@@ -142,6 +150,12 @@ final class DisposablePostgresCluster implements AutoCloseable {
                 return iface.isInstance(this);
             }
         };
+    }
+
+    void createDatabase(String database) throws SQLException {
+        try (Connection c = dataSource("postgres").getConnection(); var s = c.createStatement()) {
+            s.execute("CREATE DATABASE \"" + database.replace("\"", "\"\"") + "\"");
+        }
     }
 
     private Path dataDir() {
