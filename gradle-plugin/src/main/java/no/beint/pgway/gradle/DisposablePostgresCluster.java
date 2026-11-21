@@ -1,17 +1,25 @@
 package no.beint.pgway.gradle;
 
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Logger;
+import javax.sql.DataSource;
+import org.postgresql.Driver;
 
 /** Disposable, loopback-only PostgreSQL 19+ cluster for build-time migration verification. */
 final class DisposablePostgresCluster implements AutoCloseable {
@@ -70,6 +78,70 @@ final class DisposablePostgresCluster implements AutoCloseable {
 
     String password() {
         return password;
+    }
+
+    DataSource dataSource() {
+        Driver driver = new Driver();
+        String jdbcUrl = url();
+        return new DataSource() {
+            private PrintWriter logWriter;
+            private int loginTimeout;
+
+            @Override
+            public Connection getConnection() throws SQLException {
+                return getConnection(user(), password());
+            }
+
+            @Override
+            public Connection getConnection(String username, String pwd) throws SQLException {
+                Properties props = new Properties();
+                props.setProperty("user", username);
+                props.setProperty("password", pwd);
+                Connection conn = driver.connect(jdbcUrl, props);
+                if (conn == null) {
+                    throw new SQLException("PostgreSQL driver rejected URL: " + jdbcUrl);
+                }
+                return conn;
+            }
+
+            @Override
+            public PrintWriter getLogWriter() {
+                return logWriter;
+            }
+
+            @Override
+            public void setLogWriter(PrintWriter out) {
+                this.logWriter = out;
+            }
+
+            @Override
+            public void setLoginTimeout(int seconds) {
+                this.loginTimeout = seconds;
+            }
+
+            @Override
+            public int getLoginTimeout() {
+                return loginTimeout;
+            }
+
+            @Override
+            public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+                throw new SQLFeatureNotSupportedException();
+            }
+
+            @Override
+            public <T> T unwrap(Class<T> iface) throws SQLException {
+                if (iface.isInstance(this)) {
+                    return iface.cast(this);
+                }
+                throw new SQLException("Not a wrapper for " + iface.getName());
+            }
+
+            @Override
+            public boolean isWrapperFor(Class<?> iface) {
+                return iface.isInstance(this);
+            }
+        };
     }
 
     private Path dataDir() {

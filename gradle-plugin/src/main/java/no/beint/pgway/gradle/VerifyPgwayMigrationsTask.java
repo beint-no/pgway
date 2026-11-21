@@ -56,7 +56,7 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
         // 2. Full replay against a disposable PostgreSQL 19+ database + idempotency check
         try (var cluster = new DisposablePostgresCluster(getPostgresBin().getOrNull())) {
             Pgway pgway = Pgway.configure()
-                .dataSource(cluster.url(), cluster.user(), cluster.password())
+                .dataSource(cluster.dataSource())
                 .schema(schema)
                 .directory(migrationsPath)
                 .create();
