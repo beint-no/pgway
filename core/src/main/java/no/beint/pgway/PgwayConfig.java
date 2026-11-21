@@ -33,7 +33,6 @@ public final class PgwayConfig {
     private final Long advisoryLockKey;
     private final boolean outOfOrder;
     private final boolean validateOnMigrate;
-    private final boolean adoptFlywayHistory;
     private final boolean baselineOnMigrate;
     private final MigrationVersion baselineVersion;
     private final String baselineDescription;
@@ -75,7 +74,6 @@ public final class PgwayConfig {
         this.advisoryLockKey = builder.advisoryLockKey;
         this.outOfOrder = builder.outOfOrder;
         this.validateOnMigrate = builder.validateOnMigrate;
-        this.adoptFlywayHistory = builder.adoptFlywayHistory;
         this.baselineOnMigrate = builder.baselineOnMigrate;
         this.baselineVersion = Objects.requireNonNull(builder.baselineVersion, "baselineVersion must not be null");
         this.baselineDescription = Objects.requireNonNull(builder.baselineDescription, "baselineDescription must not be null");
@@ -136,10 +134,6 @@ public final class PgwayConfig {
         return validateOnMigrate;
     }
 
-    public boolean adoptFlywayHistory() {
-        return adoptFlywayHistory;
-    }
-
     public boolean baselineOnMigrate() {
         return baselineOnMigrate;
     }
@@ -195,7 +189,6 @@ public final class PgwayConfig {
         private Long advisoryLockKey;
         private boolean outOfOrder = false;
         private boolean validateOnMigrate = true;
-        private boolean adoptFlywayHistory = false;
         private boolean baselineOnMigrate = false;
         private MigrationVersion baselineVersion = MigrationVersion.parse("1");
         private String baselineDescription = DEFAULT_BASELINE_DESCRIPTION;
@@ -311,11 +304,6 @@ public final class PgwayConfig {
 
         public Builder validateOnMigrate(boolean validateOnMigrate) {
             this.validateOnMigrate = validateOnMigrate;
-            return this;
-        }
-
-        public Builder adoptFlywayHistory(boolean adoptFlywayHistory) {
-            this.adoptFlywayHistory = adoptFlywayHistory;
             return this;
         }
 

@@ -10,7 +10,6 @@ public record MigrationResult(
         int skippedCount,
         MigrationVersion currentVersion,
         Duration totalDuration,
-        boolean adoptedFromFlyway,
         boolean baselined) {
 
     public MigrationResult {

@@ -163,6 +163,60 @@ class PgwaySpringBootIntegrationTest {
         }
     }
 
+    @Test
+    void failsContextStartupWhenMigrationFails(@TempDir Path dir) throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("spring_fail");
+        Files.writeString(dir.resolve("V1__broken.sql"), "CREATE TABLE broken (;");
+
+        ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(
+                DataSourceAutoConfiguration.class,
+                PgwayAutoConfiguration.class
+            ))
+            .withPropertyValues(
+                "spring.datasource.url=" + pg.url(db),
+                "spring.datasource.username=" + pg.user(),
+                "spring.datasource.password=" + pg.password(),
+                "pgway.locations=filesystem:" + dir.toAbsolutePath()
+            );
+
+        runner.run(ctx -> assertNotNull(ctx.getStartupFailure(), "Context must fail to start on broken migration"));
+    }
+
+    @Test
+    void baselinesPreExistingDatabaseViaProperties(@TempDir Path dir) throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("spring_baseline");
+        try (var conn = pg.connect(db); var stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE existing_orders (id int PRIMARY KEY)");
+        }
+        Files.writeString(dir.resolve("V1__init.sql"), "CREATE TABLE existing_orders (id int PRIMARY KEY);");
+        Files.writeString(dir.resolve("V2__add_note.sql"), "ALTER TABLE existing_orders ADD COLUMN note text;");
+
+        ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(
+                DataSourceAutoConfiguration.class,
+                PgwayAutoConfiguration.class,
+                JdbcTemplateAutoConfiguration.class
+            ))
+            .withPropertyValues(
+                "spring.datasource.url=" + pg.url(db),
+                "spring.datasource.username=" + pg.user(),
+                "spring.datasource.password=" + pg.password(),
+                "pgway.locations=filesystem:" + dir.toAbsolutePath(),
+                "pgway.baseline-on-migrate=true",
+                "pgway.baseline-version=1"
+            );
+
+        runner.run(ctx -> {
+            assertTrue(ctx.getStartupFailure() == null, () -> "Startup failed: " + ctx.getStartupFailure());
+            JdbcTemplate jdbc = ctx.getBean(JdbcTemplate.class);
+            jdbc.update("INSERT INTO existing_orders (id, note) VALUES (1, 'cutover-ok')");
+            assertEquals("cutover-ok", jdbc.queryForObject("SELECT note FROM existing_orders WHERE id = 1", String.class));
+        });
+    }
+
     @Configuration(proxyBeanMethods = false)
     @EntityScan(basePackageClasses = SpringCustomerEntity.class)
     static class JpaTestConfig {

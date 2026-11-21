@@ -33,9 +33,6 @@ public class PgwayMigrationInitializer implements InitializingBean, Ordered {
         }
         MigrationResult result = pgway.migrate();
         String schema = pgway.config().defaultSchema();
-        if (result.adoptedFromFlyway()) {
-            log.info("Pgway adopted existing Flyway history in schema '{}' (version {})", schema, result.currentVersion());
-        }
         if (result.baselined()) {
             log.info("Pgway baselined schema '{}' at version {}", schema, result.currentVersion());
         }

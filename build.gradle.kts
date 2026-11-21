@@ -70,9 +70,9 @@ subprojects {
                     name.set("Pgway ${project.name}")
                     description.set(
                         when (project.name) {
-                            "core" -> "Zero-dependency PostgreSQL 19 schema migration engine for JDK 27."
-                            "spring" -> "Spring Boot 4 auto-configuration for Pgway PostgreSQL 19 migrations."
-                            else -> "Modern PostgreSQL 19 schema migrations for JDK 27."
+                            "core" -> "Zero-dependency PostgreSQL 19+ schema migration engine for JDK 27."
+                            "spring" -> "Spring Boot 4 auto-configuration for Pgway PostgreSQL 19+ migrations."
+                            else -> "Modern PostgreSQL 19+ schema migrations for JDK 27."
                         },
                     )
                     inceptionYear.set("2026")

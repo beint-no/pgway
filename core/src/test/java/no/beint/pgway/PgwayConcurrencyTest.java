@@ -123,32 +123,12 @@ class PgwayConcurrencyTest {
     }
 
     @Test
-    void concurrentFlywayAdoptionDuringRollingDeploySucceedsExactlyOnce() throws Exception {
+    void concurrentBaselineOnMigrateDuringRollingDeploySucceedsExactlyOnce() throws Exception {
         Pg19TestCluster pg = Pg19TestCluster.shared();
-        String db = pg.createDatabase("concurrent_adopt");
+        String db = pg.createDatabase("concurrent_baseline");
 
         try (Connection c = pg.connect(db); Statement s = c.createStatement()) {
-            s.execute("""
-                CREATE TABLE public.flyway_schema_history (
-                    installed_rank integer NOT NULL PRIMARY KEY,
-                    version varchar(50),
-                    description varchar(200) NOT NULL,
-                    type varchar(20) NOT NULL,
-                    script varchar(1000) NOT NULL,
-                    checksum integer,
-                    installed_by varchar(100) NOT NULL,
-                    installed_on timestamp without time zone NOT NULL DEFAULT now(),
-                    execution_time integer NOT NULL,
-                    success boolean NOT NULL
-                )
-                """);
             s.execute("CREATE TABLE existing_t (id int PRIMARY KEY)");
-            s.execute("""
-                INSERT INTO public.flyway_schema_history
-                    (installed_rank, version, description, type, script, checksum, installed_by, execution_time, success)
-                VALUES
-                    (1, '1', 'init', 'SQL', 'V1__init.sql', 111, 'reai_app', 5, true)
-                """);
         }
 
         var source = InMemoryMigrationSource.ofStrings(Map.of(
@@ -165,7 +145,8 @@ class PgwayConcurrencyTest {
                 futures.add(pool.submit(() -> {
                     Pgway pgway = Pgway.configure()
                         .dataSource(pg.url(db), pg.user(), pg.password())
-                        .adoptFlywayHistory(true)
+                        .baselineOnMigrate(true)
+                        .baselineVersion("1")
                         .addSource(source)
                         .create();
                     ready.countDown();
@@ -176,17 +157,17 @@ class PgwayConcurrencyTest {
             ready.await();
             go.countDown();
 
-            int adoptedCount = 0;
+            int baselinedCount = 0;
             int appliedTotal = 0;
             for (Future<MigrationResult> f : futures) {
                 MigrationResult r = f.get();
-                if (r.adoptedFromFlyway()) {
-                    adoptedCount++;
+                if (r.baselined()) {
+                    baselinedCount++;
                 }
                 appliedTotal += r.appliedCount();
                 assertEquals(MigrationVersion.parse("2"), r.currentVersion());
             }
-            assertEquals(1, adoptedCount, "Exactly one container should perform Flyway adoption");
+            assertEquals(1, baselinedCount, "Exactly one container should create the baseline");
             assertEquals(1, appliedTotal, "Exactly one container should apply V2");
         }
     }

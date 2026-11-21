@@ -52,7 +52,6 @@ class PgwayIntegrationTest {
         assertEquals(3, first.appliedCount());
         assertEquals(0, first.skippedCount());
         assertEquals(MigrationVersion.parse("10"), first.currentVersion());
-        assertFalse(first.adoptedFromFlyway());
         assertFalse(first.baselined());
         assertEquals(List.of("before:1", "after:1", "before:2", "after:2", "before:10", "after:10"), events);
 
@@ -361,5 +360,92 @@ class PgwayIntegrationTest {
         assertEquals(2, res.appliedCount());
         assertEquals(MigrationVersion.parse("2"), res.currentVersion());
         assertTrue(pgway.validate().valid());
+    }
+
+    @Test
+    void isolatesSessionLevelSettingsAndRollsBackResultSetReturningStatement() throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("session_isolation");
+
+        HikariConfig hc = new HikariConfig();
+        hc.setJdbcUrl(pg.url(db));
+        hc.setUsername(pg.user());
+        hc.setPassword(pg.password());
+        hc.setMaximumPoolSize(1);
+
+        try (HikariDataSource ds = new HikariDataSource(hc)) {
+            // Capture initial pool settings
+            String initialLockTimeout;
+            String initialStmtTimeout;
+            try (Connection c = ds.getConnection(); Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")) {
+                rs.next();
+                initialLockTimeout = rs.getString(1);
+                initialStmtTimeout = rs.getString(2);
+            }
+
+            // V1 mutates session-level settings (forgetting LOCAL); V2 must NOT inherit them
+            Pgway pgway = Pgway.configure()
+                .dataSource(ds)
+                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                    "V1__mutates_session.sql", """
+                        CREATE TABLE t (id int PRIMARY KEY);
+                        SET lock_timeout = '123ms';
+                        SET statement_timeout = '456ms';
+                        """,
+                    "V2__verifies_clean.sql", """
+                        DO $$
+                        BEGIN
+                            IF current_setting('lock_timeout') = '123ms'
+                               OR current_setting('statement_timeout') = '456ms' THEN
+                                RAISE EXCEPTION 'Session timeouts leaked across migrations!';
+                            END IF;
+                        END $$;
+                        """
+                )))
+                .create();
+
+            assertEquals(2, pgway.migrate().appliedCount());
+
+            // Pooled connection returned to app must also have original settings restored
+            try (Connection c = ds.getConnection(); Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")) {
+                rs.next();
+                assertEquals(initialLockTimeout, rs.getString(1));
+                assertEquals(initialStmtTimeout, rs.getString(2));
+            }
+
+            // Failing V3 whose statement 1 returns a ResultSet must still roll back statement 1 completely
+            Pgway failingV3 = Pgway.configure()
+                .dataSource(ds)
+                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                    "V1__mutates_session.sql", """
+                        CREATE TABLE t (id int PRIMARY KEY);
+                        SET lock_timeout = '123ms';
+                        SET statement_timeout = '456ms';
+                        """,
+                    "V2__verifies_clean.sql", """
+                        DO $$
+                        BEGIN
+                            IF current_setting('lock_timeout') = '123ms'
+                               OR current_setting('statement_timeout') = '456ms' THEN
+                                RAISE EXCEPTION 'Session timeouts leaked across migrations!';
+                            END IF;
+                        END $$;
+                        """,
+                    "V3__returning_then_fail.sql", """
+                        INSERT INTO t (id) VALUES (99) RETURNING id;
+                        SELECT 1 / 0;
+                        """
+                )))
+                .create();
+
+            assertThrows(PgwayMigrationException.class, failingV3::migrate);
+            try (Connection c = ds.getConnection(); Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT count(*) FROM t")) {
+                rs.next();
+                assertEquals(0, rs.getInt(1), "INSERT ... RETURNING must be rolled back when statement 2 fails");
+            }
+        }
     }
 }

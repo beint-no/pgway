@@ -200,4 +200,26 @@ class PgwayFailureAndValidationTest {
         // Calling baseline() again when history is non-empty fails cleanly
         assertThrows(PgwayValidationException.class, () -> pgway.baseline("5"));
     }
+
+    @Test
+    void baselineOnMigrateDoesNotBaselineBrandNewEmptySchema() throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("baseline_empty");
+
+        Pgway pgway = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .baselineOnMigrate(true)
+            .baselineVersion("2")
+            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                "V1__one.sql", "CREATE TABLE from_v1 (id int PRIMARY KEY);",
+                "V2__two.sql", "CREATE TABLE from_v2 (id int PRIMARY KEY);",
+                "V3__three.sql", "CREATE TABLE from_v3 (id int PRIMARY KEY);"
+            )))
+            .create();
+
+        MigrationResult res = pgway.migrate();
+        assertFalse(res.baselined(), "Empty schema must migrate from V1 rather than baseline");
+        assertEquals(3, res.appliedCount());
+        assertTrue(pgway.validate().valid());
+    }
 }

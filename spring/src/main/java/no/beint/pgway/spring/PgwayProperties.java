@@ -21,7 +21,6 @@ public class PgwayProperties {
     private Long advisoryLockKey;
     private boolean outOfOrder = false;
     private boolean validateOnMigrate = true;
-    private boolean adoptFlywayHistory = false;
     private boolean baselineOnMigrate = false;
     private String baselineVersion = "1";
     private String baselineDescription = PgwayConfig.DEFAULT_BASELINE_DESCRIPTION;
@@ -120,14 +119,6 @@ public class PgwayProperties {
 
     public void setValidateOnMigrate(boolean validateOnMigrate) {
         this.validateOnMigrate = validateOnMigrate;
-    }
-
-    public boolean isAdoptFlywayHistory() {
-        return adoptFlywayHistory;
-    }
-
-    public void setAdoptFlywayHistory(boolean adoptFlywayHistory) {
-        this.adoptFlywayHistory = adoptFlywayHistory;
     }
 
     public boolean isBaselineOnMigrate() {

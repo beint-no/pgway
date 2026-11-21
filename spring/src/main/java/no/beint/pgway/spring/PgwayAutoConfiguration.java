@@ -47,7 +47,6 @@ public final class PgwayAutoConfiguration {
             .lockTimeout(properties.getLockTimeout())
             .outOfOrder(properties.isOutOfOrder())
             .validateOnMigrate(properties.isValidateOnMigrate())
-            .adoptFlywayHistory(properties.isAdoptFlywayHistory())
             .baselineOnMigrate(properties.isBaselineOnMigrate())
             .baselineVersion(properties.getBaselineVersion())
             .baselineDescription(properties.getBaselineDescription());

@@ -188,6 +188,7 @@ class SqlScriptParserTest {
         assertThrows(PgwaySqlParseException.class, () -> SqlScriptParser.parse("V1__c.sql", "SELECT 1; COMMIT;"));
         assertThrows(PgwaySqlParseException.class, () -> SqlScriptParser.parse("V1__d.sql", "SELECT 1; ROLLBACK;"));
         assertThrows(PgwaySqlParseException.class, () -> SqlScriptParser.parse("V1__e.sql", "SELECT 1; END WORK;"));
+        assertThrows(PgwaySqlParseException.class, () -> SqlScriptParser.parse("V1__f.sql", "SELECT 1; ABORT;"));
 
         // Savepoints ARE valid inside a managed transaction
         var sp = SqlScriptParser.parse("V1__sp.sql", "SAVEPOINT s1; SELECT 1; ROLLBACK TO SAVEPOINT s1; RELEASE SAVEPOINT s1;");
@@ -212,6 +213,10 @@ class SqlScriptParserTest {
         assertThrows(
             PgwaySqlParseException.class,
             () -> SqlScriptParser.parse("V1__f.sql", "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1;")
+        );
+        assertThrows(
+            PgwaySqlParseException.class,
+            () -> SqlScriptParser.parse("V1__g.sql", "CREATE TABLE broken (id int;")
         );
     }
 

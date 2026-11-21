@@ -60,8 +60,8 @@ public final class Pg19TestCluster implements AutoCloseable {
 
         try {
             String version = run(Duration.ofSeconds(10), "postgres", "--version");
-            if (!version.matches("(?s).*PostgreSQL\\) 19\\..*")) {
-                throw new IOException("Expected PostgreSQL 19 binaries, found: " + version.strip());
+            if (!version.matches("(?s).*PostgreSQL\\) (19|[2-9][0-9])\\..*")) {
+                throw new IOException("Expected PostgreSQL 19+ binaries, found: " + version.strip());
             }
             Path pwFile = directory.resolve("pw");
             Files.writeString(pwFile, password);

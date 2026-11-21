@@ -1,11 +1,11 @@
 # Contributing to Pgway
 
-Pgway targets the current JDK (JDK 27) and PostgreSQL 19 exclusively, without backwards-compatibility shims for older versions or other database engines.
+Pgway targets the current JDK (JDK 27) and PostgreSQL 19+, without backwards-compatibility shims for older versions or other database engines.
 
 ## Requirements
 
 - JDK 27
-- PostgreSQL 19 server binaries (`postgres`, `initdb`, `pg_ctl`)
+- PostgreSQL 19+ server binaries (`postgres`, `initdb`, `pg_ctl`)
 
 ## Local verification
 

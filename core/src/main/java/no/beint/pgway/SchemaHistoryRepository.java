@@ -10,20 +10,19 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 /**
- * PostgreSQL 19 metadata, advisory locking, schema history table, and Flyway adoption operations.
+ * PostgreSQL 19+ metadata, session settings, advisory locking, and schema history persistence.
  */
 final class SchemaHistoryRepository {
     private static final int PG19_MIN_VERSION_NUM = 190000;
-    private static final int PG19_MAX_VERSION_NUM = 199999;
     private static final String SQLSTATE_LOCK_NOT_AVAILABLE = "55P03";
-    static final String FLYWAY_HISTORY_TABLE = "flyway_schema_history";
 
     private SchemaHistoryRepository() {}
 
-    static void verifyPostgres19(Connection connection) {
+    record SessionSettings(String searchPath, String lockTimeout, String statementTimeout) {}
+
+    static void verifyPostgres19OrHigher(Connection connection) {
         try (Statement stmt = connection.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT current_setting('server_version_num')::int, version()")) {
             if (!rs.next()) {
@@ -36,29 +35,48 @@ final class SchemaHistoryRepository {
             throw e;
         } catch (SQLException e) {
             throw new PgwayUnsupportedDatabaseException(
-                "Pgway requires PostgreSQL 19, but version query failed: " + e.getMessage(),
+                "Pgway requires PostgreSQL 19 or higher, but version query failed: " + e.getMessage(),
                 e
             );
         }
     }
 
     static void validateServerVersion(int serverVersionNum, String serverVersion) {
-        if (serverVersionNum < PG19_MIN_VERSION_NUM || serverVersionNum > PG19_MAX_VERSION_NUM) {
+        if (serverVersionNum < PG19_MIN_VERSION_NUM) {
             int major = serverVersionNum / 10000;
             throw new PgwayUnsupportedDatabaseException(
                 serverVersionNum,
                 serverVersion == null ? "" : serverVersion,
-                "Pgway 1.0 supports PostgreSQL 19 exclusively (found PostgreSQL "
+                "Pgway requires PostgreSQL 19 or higher (found PostgreSQL "
                     + major + ", server_version_num=" + serverVersionNum + "): " + serverVersion
             );
         }
     }
 
-    static String querySetting(Connection connection, String settingName) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement("SELECT current_setting(?)")) {
-            ps.setString(1, settingName);
+    static SessionSettings captureSessionSettings(Connection connection) throws SQLException {
+        String sql = """
+            SELECT current_setting('search_path'),
+                   current_setting('lock_timeout'),
+                   current_setting('statement_timeout')
+            """;
+        try (Statement stmt = connection.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+            rs.next();
+            return new SessionSettings(rs.getString(1), rs.getString(2), rs.getString(3));
+        }
+    }
+
+    static void restoreSessionSettings(Connection connection, SessionSettings settings) throws SQLException {
+        String sql = """
+            SELECT set_config('search_path', ?, false),
+                   set_config('lock_timeout', ?, false),
+                   set_config('statement_timeout', ?, false)
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, settings.searchPath());
+            ps.setString(2, settings.lockTimeout());
+            ps.setString(3, settings.statementTimeout());
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : "";
+                rs.next();
             }
         }
     }
@@ -292,36 +310,6 @@ final class SchemaHistoryRepository {
         }
     }
 
-    static void insertAdoptedRow(
-            Connection connection,
-            String schema,
-            String table,
-            MigrationVersion version,
-            MigrationKind kind,
-            String description,
-            String script,
-            String checksum,
-            String installedBy,
-            Instant installedOn,
-            int executionMs) throws SQLException {
-        String qualified = PgIdentifiers.qualifiedTable(schema, table);
-        String sql = """
-            INSERT INTO %s (version, kind, description, script, checksum, installed_by, installed_on, execution_ms, success)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, true)
-            """.formatted(qualified);
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setString(1, version != null ? version.value() : null);
-            ps.setString(2, kind.name());
-            ps.setString(3, description);
-            ps.setString(4, script);
-            ps.setString(5, checksum);
-            ps.setString(6, installedBy);
-            ps.setTimestamp(7, Timestamp.from(installedOn));
-            ps.setInt(8, Math.max(0, executionMs));
-            ps.executeUpdate();
-        }
-    }
-
     static int deleteFailedRows(Connection connection, String schema, String table) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
         try (Statement stmt = connection.createStatement()) {
@@ -346,45 +334,5 @@ final class SchemaHistoryRepository {
             ps.setInt(4, installedRank);
             ps.executeUpdate();
         }
-    }
-
-    record FlywayRow(
-            int installedRank,
-            String version,
-            String description,
-            String type,
-            String script,
-            String installedBy,
-            Instant installedOn,
-            int executionTime,
-            boolean success) {}
-
-    static List<FlywayRow> readFlywayHistory(Connection connection, String schema) throws SQLException {
-        String qualified = PgIdentifiers.qualifiedTable(schema, FLYWAY_HISTORY_TABLE);
-        String sql = """
-            SELECT installed_rank, version, description, type, script, installed_by, installed_on, execution_time, success
-            FROM %s
-            ORDER BY installed_rank ASC
-            """.formatted(qualified);
-        List<FlywayRow> rows = new ArrayList<>();
-        try (Statement stmt = connection.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
-            while (rs.next()) {
-                Timestamp ts = rs.getTimestamp("installed_on");
-                Instant installedOn = ts != null ? ts.toInstant() : Instant.now();
-                String type = rs.getString("type");
-                rows.add(new FlywayRow(
-                    rs.getInt("installed_rank"),
-                    rs.getString("version"),
-                    rs.getString("description"),
-                    type == null ? "" : type.toUpperCase(Locale.ROOT),
-                    rs.getString("script"),
-                    rs.getString("installed_by"),
-                    installedOn,
-                    rs.getInt("execution_time"),
-                    rs.getBoolean("success")
-                ));
-            }
-        }
-        return List.copyOf(rows);
     }
 }

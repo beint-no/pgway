@@ -55,7 +55,6 @@ public final class SqlScriptParser {
         Set<String> seenDirectives = new HashSet<>();
 
         List<SqlStatement> statements = new ArrayList<>();
-        int stmtStartIndex = 0;
         int stmtFirstTokenStart = -1;
         int stmtFirstTokenLine = -1;
         String firstKeyword = null;
@@ -327,7 +326,6 @@ public final class SqlScriptParser {
                         statements.add(new SqlStatement(statements.size() + 1, stmtFirstTokenLine, stmtText));
                     }
                     i++;
-                    stmtStartIndex = i;
                     stmtFirstTokenStart = -1;
                     stmtFirstTokenLine = -1;
                     firstKeyword = null;
@@ -390,6 +388,13 @@ public final class SqlScriptParser {
                 "Unterminated BEGIN ATOMIC block"
             );
         }
+        if (parenDepth > 0) {
+            throw new PgwaySqlParseException(
+                scriptName,
+                stmtFirstTokenLine > 0 ? stmtFirstTokenLine : line,
+                "Unterminated parenthesized expression ('(' without matching ')')"
+            );
+        }
 
         // Trailing statement without final semicolon
         if (stmtFirstTokenStart != -1 && stmtFirstTokenStart < len) {
@@ -398,10 +403,6 @@ public final class SqlScriptParser {
                 validateStatement(scriptName, stmtFirstTokenLine, transactional, firstKeyword, secondKeyword);
                 statements.add(new SqlStatement(statements.size() + 1, stmtFirstTokenLine, stmtText));
             }
-        }
-        // Keep stmtStartIndex referenced cleanly (no unused warning)
-        if (stmtStartIndex < 0) {
-            throw new AssertionError();
         }
 
         return new ParsedScript(
@@ -422,8 +423,7 @@ public final class SqlScriptParser {
         boolean forbidden = switch (firstKeyword) {
             case "BEGIN" -> !"ATOMIC".equals(secondKeyword);
             case "START" -> "TRANSACTION".equals(secondKeyword);
-            case "COMMIT" -> true;
-            case "END" -> true;
+            case "COMMIT", "END", "ABORT" -> true;
             case "ROLLBACK" -> !"TO".equals(secondKeyword);
             case "PREPARE" -> "TRANSACTION".equals(secondKeyword);
             default -> false;

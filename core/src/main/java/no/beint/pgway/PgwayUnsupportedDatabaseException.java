@@ -1,6 +1,6 @@
 package no.beint.pgway;
 
-/** Thrown when connected to anything other than PostgreSQL 19. */
+/** Thrown when connected to a database older than PostgreSQL 19 (or a non-PostgreSQL database). */
 public final class PgwayUnsupportedDatabaseException extends PgwayException {
     private static final long serialVersionUID = 1L;
     private final int serverVersionNum;

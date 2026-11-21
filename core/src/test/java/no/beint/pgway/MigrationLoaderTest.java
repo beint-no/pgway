@@ -20,13 +20,18 @@ import org.junit.jupiter.api.io.TempDir;
 class MigrationLoaderTest {
 
     @Test
-    void enforcesPostgres19ServerVersionExclusively() {
-        // PG 19.0 .. 19.99 accepted
+    void enforcesPostgres19OrHigher() {
+        // PG 19 and future majors accepted
         SchemaHistoryRepository.validateServerVersion(190000, "PostgreSQL 19.0");
         SchemaHistoryRepository.validateServerVersion(190005, "PostgreSQL 19.5");
-        SchemaHistoryRepository.validateServerVersion(199999, "PostgreSQL 19.9999");
+        SchemaHistoryRepository.validateServerVersion(200000, "PostgreSQL 20.0");
+        SchemaHistoryRepository.validateServerVersion(250003, "PostgreSQL 25.3");
 
-        // PG 18 and PG 20 rejected
+        // PG < 19 rejected
+        assertThrows(
+            PgwayUnsupportedDatabaseException.class,
+            () -> SchemaHistoryRepository.validateServerVersion(189999, "PostgreSQL 18.99")
+        );
         assertThrows(
             PgwayUnsupportedDatabaseException.class,
             () -> SchemaHistoryRepository.validateServerVersion(180005, "PostgreSQL 18.5")
@@ -34,10 +39,6 @@ class MigrationLoaderTest {
         assertThrows(
             PgwayUnsupportedDatabaseException.class,
             () -> SchemaHistoryRepository.validateServerVersion(170002, "PostgreSQL 17.2")
-        );
-        assertThrows(
-            PgwayUnsupportedDatabaseException.class,
-            () -> SchemaHistoryRepository.validateServerVersion(200000, "PostgreSQL 20.0")
         );
     }
 
