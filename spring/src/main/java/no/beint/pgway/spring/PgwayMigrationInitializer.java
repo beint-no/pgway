@@ -27,6 +27,13 @@ public final class PgwayMigrationInitializer implements InitializingBean, Ordere
         MigrationResult result = pgway.migrate();
         String schema = pgway.config().schema();
         String versionLabel = result.currentVersion() > 0 ? "V" + result.currentVersion() : "none";
+        if (result.compactedFromVersion() > 0) {
+            log.info(
+                "Pgway compacted history V1..V{} -> V1 in schema '{}'",
+                result.compactedFromVersion(),
+                schema
+            );
+        }
         if (result.appliedCount() == 0) {
             log.info(
                 "Pgway schema '{}' is up to date ({}, {} ms)",

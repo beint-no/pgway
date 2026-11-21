@@ -29,15 +29,15 @@ Requires **JDK 27** and **PostgreSQL 19 or higher**.
   Unknown, duplicate, or misplaced directives fail the build.
 - **JDK 27 `ScopedValue` context:** `Pgway.currentMigration()` exposes an immutable `MigrationContext` (`schema`, `version`, `script`, `checksum`, `startedAt`) to `MigrationListener`s with zero `ThreadLocal` leaks.
 - **Fail-closed on non-empty schemas:** if `pgway_history` does not exist and the target schema already contains user tables/objects, `migrate()` and `validate()` refuse to proceed instead of replaying `V1..Vn` against an existing database (extension-owned objects are ignored).
-- **Compaction instead of baseline:** when cutting over an existing database or squashing `V1..Vn` into a compacted `V1`, replace `pgway_history` with the single `V1` row (`pgway.compactHistory()` or a single SQL `INSERT`).
+- **Seamless migration compaction (`compactPgwayMigrations`):** squash `V1..Vn` into a single, compact, idiomatic `V1` schema file (folding `ALTER TABLE` changes directly into `CREATE TABLE`, omitting PG-default names and `USING btree`, preserving PG 19 `VIRTUAL`/`STORED` columns, storage settings, views, functions, triggers, comments, and conditional external-role grant blocks). Before rewriting any file, Pgway proves against a disposable PostgreSQL 19+ cluster that no tables contain seed rows, that the compacted `V1` is 100% catalog-equivalent to `V1..Vn`, and that existing `V1..Vn` databases auto-compact their `pgway_history` via the embedded `-- pgway: replaces=V<n>:<chain-sha256>` directive on next startup (zero manual DB patching).
 
 ## Usage
 
-### Build-time verification (`no.beint.pgway` Gradle plugin)
+### Build-time verification and compaction (`no.beint.pgway` Gradle plugin)
 
 ```kotlin
 plugins {
-    id("no.beint.pgway") version "3.0.2"
+    id("no.beint.pgway") version "3.1.0"
 }
 ```
 
@@ -49,11 +49,12 @@ pgway {
 }
 ```
 
-`verifyPgwayMigrations` runs automatically on `processResources` and `check` (incremental and `UP-TO-DATE` in 0 ms when migrations are unchanged).
+- `verifyPgwayMigrations` runs automatically on `processResources` and `check` (incremental and `UP-TO-DATE` in 0 ms when migrations are unchanged).
+- `compactPgwayMigrations` runs on demand (`./gradlew compactPgwayMigrations`) to squash `V1..Vn` into a verified `V1` with automatic history compaction for existing databases.
 
 ### Spring Boot 4 (`no.beint.pgway:spring`)
 
-Add `implementation("no.beint.pgway:spring:3.0.2")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
+Add `implementation("no.beint.pgway:spring:3.1.0")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
 
 | Property | Default | Purpose |
 |---|---|---|

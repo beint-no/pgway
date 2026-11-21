@@ -24,6 +24,7 @@ import java.util.regex.Pattern;
  */
 public final class SqlScriptParser {
     private static final Pattern DURATION_PATTERN = Pattern.compile("^([0-9]+)(ms|s|m|min|h)?$");
+    private static final Pattern REPLACES_PATTERN = Pattern.compile("^V([1-9][0-9]*):([0-9a-fA-F]{64})$");
 
     private SqlScriptParser() {}
 
@@ -52,6 +53,7 @@ public final class SqlScriptParser {
         boolean transactional = true;
         Duration lockTimeout = null;
         Duration statementTimeout = null;
+        ReplacesHistory replaces = null;
         Set<String> seenDirectives = new HashSet<>();
 
         List<SqlStatement> statements = new ArrayList<>();
@@ -128,10 +130,12 @@ public final class SqlScriptParser {
                         }
                         case "lock_timeout" -> lockTimeout = parseDuration(scriptName, commentLine, key, val);
                         case "statement_timeout" -> statementTimeout = parseDuration(scriptName, commentLine, key, val);
+                        case "replaces" -> replaces = parseReplaces(scriptName, commentLine, val);
                         default -> throw new PgwaySqlParseException(
                             scriptName,
                             commentLine,
-                            "Unknown pgway directive: '" + key + "' (supported: transaction, lock_timeout, statement_timeout)"
+                            "Unknown pgway directive: '" + key
+                                + "' (supported: transaction, lock_timeout, statement_timeout, replaces)"
                         );
                     }
                 }
@@ -406,7 +410,7 @@ public final class SqlScriptParser {
         }
 
         return new ParsedScript(
-            new MigrationDirectives(transactional, lockTimeout, statementTimeout),
+            new MigrationDirectives(transactional, lockTimeout, statementTimeout, replaces),
             List.copyOf(statements)
         );
     }
@@ -445,6 +449,25 @@ public final class SqlScriptParser {
     private static boolean isPgwayDirective(String trimmedComment) {
         return trimmedComment.length() >= 6
             && trimmedComment.regionMatches(true, 0, "pgway:", 0, 6);
+    }
+
+    static ReplacesHistory parseReplaces(String scriptName, int line, String raw) {
+        Matcher m = REPLACES_PATTERN.matcher(raw.trim());
+        if (!m.matches()) {
+            throw new PgwaySqlParseException(
+                scriptName,
+                line,
+                "Invalid value for pgway directive 'replaces': '" + raw
+                    + "' (expected V<version>:<64-hex-sha256>, e.g. V5:<sha256>)"
+            );
+        }
+        int version;
+        try {
+            version = Integer.parseInt(m.group(1));
+        } catch (NumberFormatException _) {
+            throw new PgwaySqlParseException(scriptName, line, "Version overflow in pgway directive 'replaces': " + raw);
+        }
+        return new ReplacesHistory(version, m.group(2).toLowerCase(Locale.ROOT));
     }
 
     static Duration parseDuration(String scriptName, int line, String key, String raw) {
