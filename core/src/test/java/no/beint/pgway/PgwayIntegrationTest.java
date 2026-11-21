@@ -34,7 +34,7 @@ class PgwayIntegrationTest {
         List<String> events = new ArrayList<>();
         Pgway pgway = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(source)
+            .source(source)
             .listener(new MigrationListener() {
                 @Override
                 public void beforeMigration(MigrationScript script) {
@@ -111,7 +111,7 @@ class PgwayIntegrationTest {
 
         Pgway pgway = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(source)
+            .source(source)
             .create();
 
         MigrationResult result = pgway.migrate();
@@ -143,7 +143,7 @@ class PgwayIntegrationTest {
 
         Pgway pgway1 = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__events.sql", v1,
                 "R__event_summary.sql", r1
             )))
@@ -160,7 +160,7 @@ class PgwayIntegrationTest {
         // Changed repeatable shows OUTDATED in info() and re-runs on migrate()
         Pgway pgway2 = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__events.sql", v1,
                 "R__event_summary.sql", r2
             )))
@@ -193,9 +193,8 @@ class PgwayIntegrationTest {
 
         Pgway pgway = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .schemas("utin")
-            .createSchemas(true)
-            .addSource(source)
+            .schema("utin")
+            .source(source)
             .create();
 
         MigrationResult res = pgway.migrate();
@@ -230,7 +229,7 @@ class PgwayIntegrationTest {
             // 1. Failing transactional migration must roll back statement 1 even with autosave=always!
             Pgway failing = Pgway.configure()
                 .dataSource(ds)
-                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                .source(InMemoryMigrationSource.ofStrings(Map.of(
                     "V1__partial.sql", """
                         CREATE TABLE must_rollback (id int PRIMARY KEY);
                         INSERT INTO nonexistent_table VALUES (1);
@@ -258,7 +257,7 @@ class PgwayIntegrationTest {
             // 2. Fix script and migrate cleanly without repair()
             Pgway fixed = Pgway.configure()
                 .dataSource(ds)
-                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                .source(InMemoryMigrationSource.ofStrings(Map.of(
                     "V1__partial.sql", "CREATE TABLE must_rollback (id int PRIMARY KEY);"
                 )))
                 .create();
@@ -286,7 +285,7 @@ class PgwayIntegrationTest {
 
         Pgway pgway = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__slow.sql", """
                     -- pgway: statement_timeout=150ms
                     SELECT pg_sleep(2);
@@ -305,7 +304,7 @@ class PgwayIntegrationTest {
 
         Pgway setup = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__init.sql", "CREATE TABLE locked_t (id int PRIMARY KEY);"
             )))
             .create();
@@ -320,7 +319,7 @@ class PgwayIntegrationTest {
             Pgway alter = Pgway.configure()
                 .dataSource(pg.url(db), pg.user(), pg.password())
                 .migrationLockTimeout(Duration.ofMillis(150))
-                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                .source(InMemoryMigrationSource.ofStrings(Map.of(
                     "V1__init.sql", "CREATE TABLE locked_t (id int PRIMARY KEY);",
                     "V2__add_col.sql", "ALTER TABLE locked_t ADD COLUMN note text;"
                 )))
@@ -339,7 +338,7 @@ class PgwayIntegrationTest {
 
         Pgway pgway = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__multi_schema_and_returning.sql", """
                     SET LOCAL check_function_bodies = false;
                     CREATE SCHEMA bud;
@@ -387,7 +386,7 @@ class PgwayIntegrationTest {
             // V1 mutates session-level settings (forgetting LOCAL); V2 must NOT inherit them
             Pgway pgway = Pgway.configure()
                 .dataSource(ds)
-                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                .source(InMemoryMigrationSource.ofStrings(Map.of(
                     "V1__mutates_session.sql", """
                         CREATE TABLE t (id int PRIMARY KEY);
                         SET lock_timeout = '123ms';
@@ -418,7 +417,7 @@ class PgwayIntegrationTest {
             // Failing V3 whose statement 1 returns a ResultSet must still roll back statement 1 completely
             Pgway failingV3 = Pgway.configure()
                 .dataSource(ds)
-                .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+                .source(InMemoryMigrationSource.ofStrings(Map.of(
                     "V1__mutates_session.sql", """
                         CREATE TABLE t (id int PRIMARY KEY);
                         SET lock_timeout = '123ms';

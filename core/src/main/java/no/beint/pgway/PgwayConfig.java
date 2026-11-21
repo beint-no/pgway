@@ -13,57 +13,40 @@ import java.util.Objects;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
 
-/** Immutable configuration for {@link Pgway}. */
+/**
+ * Immutable, convention-first configuration for {@link Pgway}.
+ *
+ * <p>Conventions:
+ * <ul>
+ *   <li>Migrations live in {@code db/migration} on the classpath unless directories or sources are supplied</li>
+ *   <li>Target schema is {@code public} (non-{@code public} schemas are created automatically)</li>
+ *   <li>History table is always {@code pgway_schema_history} in the target schema</li>
+ *   <li>Migrations are always validated and strictly ordered before execution</li>
+ * </ul>
+ */
 public final class PgwayConfig {
     public static final String DEFAULT_SCHEMA = "public";
-    public static final String DEFAULT_HISTORY_TABLE = "pgway_schema_history";
-    public static final String DEFAULT_LOCATION = "classpath:db/migration";
+    public static final String HISTORY_TABLE = "pgway_schema_history";
+    public static final String DEFAULT_CLASSPATH_LOCATION = "db/migration";
     public static final Duration DEFAULT_LOCK_TIMEOUT = Duration.ofSeconds(30);
-    public static final String DEFAULT_BASELINE_DESCRIPTION = "<< Pgway Baseline >>";
+    static final String BASELINE_DESCRIPTION = "<< Pgway Baseline >>";
 
     private final DataSource dataSource;
     private final List<MigrationSource> sources;
-    private final List<String> schemas;
-    private final String defaultSchema;
-    private final boolean createSchemas;
-    private final String historyTable;
+    private final String schema;
     private final Duration lockTimeout;
     private final Duration migrationLockTimeout;
     private final Duration migrationStatementTimeout;
-    private final Long advisoryLockKey;
-    private final boolean outOfOrder;
-    private final boolean validateOnMigrate;
     private final boolean baselineOnMigrate;
     private final MigrationVersion baselineVersion;
-    private final String baselineDescription;
     private final MigrationListener listener;
 
     private PgwayConfig(Builder builder) {
         this.dataSource = Objects.requireNonNull(builder.dataSource, "dataSource must be configured");
         this.sources = builder.sources.isEmpty()
-            ? List.of(parseLocation(DEFAULT_LOCATION, builder.classLoader))
+            ? List.of(new ClasspathMigrationSource(DEFAULT_CLASSPATH_LOCATION))
             : List.copyOf(builder.sources);
-
-        List<String> validatedSchemas = new ArrayList<>();
-        for (String schema : builder.schemas) {
-            validatedSchemas.add(PgIdentifiers.validateIdentifier(schema, "schema"));
-        }
-        if (builder.defaultSchema != null) {
-            this.defaultSchema = PgIdentifiers.validateIdentifier(builder.defaultSchema, "defaultSchema");
-            if (validatedSchemas.isEmpty()) {
-                validatedSchemas.add(this.defaultSchema);
-            } else if (!validatedSchemas.contains(this.defaultSchema)) {
-                validatedSchemas.addFirst(this.defaultSchema);
-            }
-        } else if (!validatedSchemas.isEmpty()) {
-            this.defaultSchema = validatedSchemas.getFirst();
-        } else {
-            this.defaultSchema = DEFAULT_SCHEMA;
-        }
-        this.schemas = List.copyOf(validatedSchemas);
-
-        this.createSchemas = builder.createSchemas;
-        this.historyTable = PgIdentifiers.validateIdentifier(builder.historyTable, "historyTable");
+        this.schema = PgIdentifiers.validateIdentifier(builder.schema, "schema");
         this.lockTimeout = validateNonNegative(builder.lockTimeout, "lockTimeout");
         this.migrationLockTimeout = builder.migrationLockTimeout == null
             ? null
@@ -71,12 +54,8 @@ public final class PgwayConfig {
         this.migrationStatementTimeout = builder.migrationStatementTimeout == null
             ? null
             : validateNonNegative(builder.migrationStatementTimeout, "migrationStatementTimeout");
-        this.advisoryLockKey = builder.advisoryLockKey;
-        this.outOfOrder = builder.outOfOrder;
-        this.validateOnMigrate = builder.validateOnMigrate;
         this.baselineOnMigrate = builder.baselineOnMigrate;
         this.baselineVersion = Objects.requireNonNull(builder.baselineVersion, "baselineVersion must not be null");
-        this.baselineDescription = Objects.requireNonNull(builder.baselineDescription, "baselineDescription must not be null");
         this.listener = Objects.requireNonNull(builder.listener, "listener must not be null");
     }
 
@@ -92,20 +71,8 @@ public final class PgwayConfig {
         return sources;
     }
 
-    public List<String> schemas() {
-        return schemas;
-    }
-
-    public String defaultSchema() {
-        return defaultSchema;
-    }
-
-    public boolean createSchemas() {
-        return createSchemas;
-    }
-
-    public String historyTable() {
-        return historyTable;
+    public String schema() {
+        return schema;
     }
 
     public Duration lockTimeout() {
@@ -120,18 +87,8 @@ public final class PgwayConfig {
         return migrationStatementTimeout;
     }
 
-    public long resolvedAdvisoryLockKey() {
-        return advisoryLockKey != null
-            ? advisoryLockKey
-            : PgIdentifiers.deriveAdvisoryLockKey(defaultSchema, historyTable);
-    }
-
-    public boolean outOfOrder() {
-        return outOfOrder;
-    }
-
-    public boolean validateOnMigrate() {
-        return validateOnMigrate;
+    public long advisoryLockKey() {
+        return PgIdentifiers.deriveAdvisoryLockKey(schema, HISTORY_TABLE);
     }
 
     public boolean baselineOnMigrate() {
@@ -142,29 +99,8 @@ public final class PgwayConfig {
         return baselineVersion;
     }
 
-    public String baselineDescription() {
-        return baselineDescription;
-    }
-
     public MigrationListener listener() {
         return listener;
-    }
-
-    static MigrationSource parseLocation(String location, ClassLoader classLoader) {
-        Objects.requireNonNull(location, "location must not be null");
-        String trimmed = location.trim();
-        if (trimmed.startsWith("filesystem:")) {
-            return new FilesystemMigrationSource(Path.of(trimmed.substring("filesystem:".length())));
-        }
-        if (trimmed.startsWith("classpath:")) {
-            String path = trimmed.substring("classpath:".length());
-            return classLoader != null
-                ? new ClasspathMigrationSource(path, classLoader)
-                : new ClasspathMigrationSource(path);
-        }
-        return classLoader != null
-            ? new ClasspathMigrationSource(trimmed, classLoader)
-            : new ClasspathMigrationSource(trimmed);
     }
 
     private static Duration validateNonNegative(Duration duration, String name) {
@@ -178,20 +114,12 @@ public final class PgwayConfig {
     public static final class Builder {
         private DataSource dataSource;
         private final List<MigrationSource> sources = new ArrayList<>();
-        private ClassLoader classLoader;
-        private final List<String> schemas = new ArrayList<>();
-        private String defaultSchema;
-        private boolean createSchemas = true;
-        private String historyTable = DEFAULT_HISTORY_TABLE;
+        private String schema = DEFAULT_SCHEMA;
         private Duration lockTimeout = DEFAULT_LOCK_TIMEOUT;
         private Duration migrationLockTimeout;
         private Duration migrationStatementTimeout;
-        private Long advisoryLockKey;
-        private boolean outOfOrder = false;
-        private boolean validateOnMigrate = true;
         private boolean baselineOnMigrate = false;
         private MigrationVersion baselineVersion = MigrationVersion.parse("1");
-        private String baselineDescription = DEFAULT_BASELINE_DESCRIPTION;
         private MigrationListener listener = MigrationListener.NOOP;
 
         private Builder() {}
@@ -206,28 +134,13 @@ public final class PgwayConfig {
             return this;
         }
 
-        public Builder classLoader(ClassLoader classLoader) {
-            this.classLoader = classLoader;
-            return this;
-        }
-
-        public Builder locations(String... locations) {
+        public Builder directory(Path directory) {
             this.sources.clear();
-            for (String location : locations) {
-                this.sources.add(parseLocation(location, classLoader));
-            }
+            this.sources.add(new FilesystemMigrationSource(directory));
             return this;
         }
 
-        public Builder locations(List<String> locations) {
-            this.sources.clear();
-            for (String location : locations) {
-                this.sources.add(parseLocation(location, classLoader));
-            }
-            return this;
-        }
-
-        public Builder paths(Path... directories) {
+        public Builder directories(Path... directories) {
             this.sources.clear();
             for (Path dir : directories) {
                 this.sources.add(new FilesystemMigrationSource(dir));
@@ -235,7 +148,20 @@ public final class PgwayConfig {
             return this;
         }
 
-        public Builder addSource(MigrationSource source) {
+        public Builder classpath(String resourcePath) {
+            this.sources.clear();
+            this.sources.add(new ClasspathMigrationSource(resourcePath));
+            return this;
+        }
+
+        public Builder classpath(String resourcePath, ClassLoader classLoader) {
+            this.sources.clear();
+            this.sources.add(new ClasspathMigrationSource(resourcePath, classLoader));
+            return this;
+        }
+
+        public Builder source(MigrationSource source) {
+            this.sources.clear();
             this.sources.add(Objects.requireNonNull(source, "source must not be null"));
             return this;
         }
@@ -248,32 +174,8 @@ public final class PgwayConfig {
             return this;
         }
 
-        public Builder schemas(String... schemas) {
-            this.schemas.clear();
-            for (String schema : schemas) {
-                this.schemas.add(schema);
-            }
-            return this;
-        }
-
-        public Builder schemas(List<String> schemas) {
-            this.schemas.clear();
-            this.schemas.addAll(schemas);
-            return this;
-        }
-
-        public Builder defaultSchema(String defaultSchema) {
-            this.defaultSchema = defaultSchema;
-            return this;
-        }
-
-        public Builder createSchemas(boolean createSchemas) {
-            this.createSchemas = createSchemas;
-            return this;
-        }
-
-        public Builder historyTable(String historyTable) {
-            this.historyTable = historyTable;
+        public Builder schema(String schema) {
+            this.schema = Objects.requireNonNull(schema, "schema must not be null");
             return this;
         }
 
@@ -292,21 +194,6 @@ public final class PgwayConfig {
             return this;
         }
 
-        public Builder advisoryLockKey(long advisoryLockKey) {
-            this.advisoryLockKey = advisoryLockKey;
-            return this;
-        }
-
-        public Builder outOfOrder(boolean outOfOrder) {
-            this.outOfOrder = outOfOrder;
-            return this;
-        }
-
-        public Builder validateOnMigrate(boolean validateOnMigrate) {
-            this.validateOnMigrate = validateOnMigrate;
-            return this;
-        }
-
         public Builder baselineOnMigrate(boolean baselineOnMigrate) {
             this.baselineOnMigrate = baselineOnMigrate;
             return this;
@@ -319,11 +206,6 @@ public final class PgwayConfig {
 
         public Builder baselineVersion(String baselineVersion) {
             this.baselineVersion = MigrationVersion.parse(baselineVersion);
-            return this;
-        }
-
-        public Builder baselineDescription(String baselineDescription) {
-            this.baselineDescription = baselineDescription;
             return this;
         }
 

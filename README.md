@@ -1,94 +1,87 @@
 # Pgway
 
-Modern PostgreSQL 19+ schema migrations for JDK 27.
+Convention-first PostgreSQL 19+ schema migrations for JDK 27.
 
-Pgway is a focused replacement for Flyway built specifically for PostgreSQL 19+ and modern JVM applications. No multi-database abstractions, no legacy compatibility layers, no commercial feature gates, and no runtime dependencies in `core`.
+Pgway is a focused replacement for Flyway with one clear way to do things: no multi-database abstractions, no legacy compatibility shims, no redundant configuration knobs, zero runtime dependencies in `core`, and a Gradle plugin that verifies every migration against a real disposable PostgreSQL 19+ instance at build time.
 
-Requires **JDK 27** and **PostgreSQL 19 or higher**. Connections to PostgreSQL versions older than 19 are rejected immediately.
+Requires **JDK 27** and **PostgreSQL 19 or higher**.
 
 ## Modules
 
 - **`no.beint.pgway:core`** — Zero-dependency PostgreSQL 19+ migration engine. Supply pgjdbc and your `DataSource` / pool.
-- **`no.beint.pgway:spring`** — Spring Boot 4 auto-configuration (`PgwayAutoConfiguration`), `PgwayProperties` (`pgway.*`), `DatabaseInitializerDetector` (runs before JPA/Hibernate and JDBC beans), `SchemaManagementProvider`, and Spring `ResourcePatternResolver` support for multi-module and executable nested JARs.
+- **`no.beint.pgway:spring`** — Convention-first Spring Boot 4 auto-configuration (`PgwayAutoConfiguration`), `DatabaseInitializerDetector` (runs before JPA/Hibernate and JDBC beans), and `SchemaManagementProvider`.
+- **`no.beint.pgway`** (`gradle-plugin`) — Gradle plugin that validates and replays `src/main/resources/db/migration` against PostgreSQL 19+ during `processResources` and `check`, failing the build immediately if anything is wrong.
 
-## Design choices
+## Conventions (one way to do things)
 
-- **PostgreSQL 19+ only**: Enforces `server_version_num >= 190000`. Targets modern PostgreSQL features natively (`GENERATED ... VIRTUAL`, `BEGIN ATOMIC ... END` SQL functions, nested `/* /* */ */` block comments, `$tag$` dollar quotes, `CREATE INDEX CONCURRENTLY`).
-- **Atomic transactional DDL**: Transactional migrations record their `pgway_schema_history` row inside the **same transaction** as the DDL. If a transactional migration fails, PostgreSQL rolls back everything cleanly without leaving a dirty failed row that requires manual `repair()`.
-- **Explicit non-transactional directives**: Use inline SQL comments at the top of a migration file instead of sidecar `.conf` files:
+- **Migrations location:** always `src/main/resources/db/migration` (`classpath*:db/migration/**/*.sql`).
+- **History table:** always `pgway_schema_history` in the target schema (default `public`; non-`public` schemas are created automatically).
+- **Ordering & validation:** always strictly ordered and validated before execution.
+- **Atomic transactional DDL:** transactional migrations commit their `pgway_schema_history` row in the **same transaction** as the DDL. Failed transactional migrations roll back cleanly without leaving dirty history rows.
+- **Inline `-- pgway:` directives:** configure non-transactional execution (`CREATE INDEX CONCURRENTLY`) and per-migration timeouts directly at the top of the `.sql` file (no `.sql.conf` sidecars):
   ```sql
   -- pgway: transaction=false
   -- pgway: lock_timeout=10s
   -- pgway: statement_timeout=5min
   CREATE INDEX CONCURRENTLY users_email_idx ON users (email);
   ```
-  Non-transactional failures record a `success = false` row and block subsequent migrations until inspected and cleared with `repair()`. Unknown, duplicate, or misplaced `-- pgway:` directives fail fast.
-- **Session-level advisory locking & session hygiene**: Serializes concurrent rolling-deploy startups via `pg_advisory_lock` keyed by `SHA-256("pgway:lock:<schema>.<table>")` with bounded `lock_timeout`. Works cleanly with single-connection pools, `auto-commit=false` HikariCP pools, `autosave=always`, and non-transactional migrations. Restores `search_path`, `lock_timeout`, and `statement_timeout` after each migration so scripts cannot leak session state into subsequent migrations or the connection pool.
-- **SHA-256 checksums & strict UTF-8**: History rows use `timestamptz`, `text`, and normalized LF SHA-256 checksums (64 hex chars). Malformed UTF-8 and invalid `.sql` filenames fail fast; non-`.sql` files (such as `AGENTS.md`) are ignored.
-- **No `clean()` footgun**: Destructive schema wiping is intentionally absent.
+  Unknown, duplicate, or misplaced directives fail the build.
+- **Session-level advisory lock & hygiene:** serializes concurrent startups via `pg_advisory_lock` with bounded `lock_timeout`, and restores `search_path`, `lock_timeout`, and `statement_timeout` after every migration.
+- **SHA-256 checksums & strict UTF-8:** malformed UTF-8 and invalid `.sql` filenames fail fast; non-`.sql` files (such as `AGENTS.md`) are ignored. No `clean()` footgun.
 
 ## Usage
+
+### Build-time verification (`no.beint.pgway` Gradle plugin)
+
+```kotlin
+plugins {
+    id("no.beint.pgway") version "2.0.0"
+}
+```
+
+That's all for `public` schema apps. For a custom schema:
+
+```kotlin
+pgway {
+    schema.set("utin")
+}
+```
+
+`verifyPgwayMigrations` runs automatically on `processResources` and `check` (incremental and `UP-TO-DATE` in 0 ms when migrations are unchanged).
+
+### Spring Boot 4 (`no.beint.pgway:spring`)
+
+Add `implementation("no.beint.pgway:spring:2.0.0")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
+
+| Property | Default | Purpose |
+|---|---|---|
+| `pgway.enabled` | `true` | Disable in tests without a database (also backs off automatically when no `DataSource` bean exists) |
+| `pgway.schema` | `public` | Target PostgreSQL schema |
+| `pgway.lock-timeout` | `30s` | Timeout acquiring Pgway's session advisory lock |
+| `pgway.migration-lock-timeout` | unset | Default `lock_timeout` per migration |
+| `pgway.migration-statement-timeout` | unset | Default `statement_timeout` per migration |
+| `pgway.baseline-on-migrate` | `false` | Baseline a pre-existing non-empty schema without `pgway_schema_history` (no-op on empty databases) |
+| `pgway.baseline-version` | `1` | Version recorded when `baseline-on-migrate` triggers |
 
 ### Programmatic (`no.beint.pgway:core`)
 
 ```java
 Pgway pgway = Pgway.configure()
     .dataSource(dataSource)
-    .locations("classpath:db/migration")
-    .migrationLockTimeout(Duration.ofSeconds(10))
+    .directory(migrationsDir)
     .create();
 
 MigrationResult result = pgway.migrate();
 ```
 
-Multiple locations (`filesystem:` and `classpath:`), `paths(Path...)`, custom `MigrationSource` implementations, `validate()`, `validateOrThrow()`, `info()`, `repair()`, `repair(true)` (checksum realignment), and `baseline(...)` are exposed on `Pgway`.
-
-### Spring Boot 4 (`no.beint.pgway:spring`)
-
-Add `no.beint.pgway:spring:1.0.0` (which pulls `no.beint.pgway:core`) alongside `org.postgresql:postgresql`. Auto-configuration runs `PgwayMigrationInitializer` before JPA `EntityManagerFactory`, `JdbcTemplate`, and other database consumers initialize.
-
-```yaml
-pgway:
-  locations:
-    - classpath*:db/migration
-  schemas:
-    - public
-  lock-timeout: 30s
-  migration-lock-timeout: 10s
-```
-
-Disable in slice tests with `pgway.enabled=false`. Customize programmatically with `PgwayConfigurationCustomizer`, `PgwayMigrationStrategy`, or `MigrationListener` beans.
-
-### Adopting Pgway on an existing database
-
-For a database that already has tables applied through version `N`, enable baseline-on-migrate for the cutover deploy:
-
-```yaml
-pgway:
-  baseline-on-migrate: true
-  baseline-version: 25
-```
-
-On an empty database (such as local dev or CI), `baseline-on-migrate` does nothing and migrations run from `V1` normally. On a non-empty schema without `pgway_schema_history`, Pgway atomically creates the history table with a `BASELINE` row at `baseline-version` and applies only versions higher than `baseline-version`.
-
 ## Migration naming
 
-- Versioned: `V<version>__<description>.sql` (e.g. `V1__init.sql`, `V25__sync_toggles.sql`, `V1.2__patch.sql`, `V1_2__patch.sql`). Versions compare numerically across segments (`V2 < V10`); duplicate numeric equivalents (`V1` and `V01` or `V1.0`) are rejected.
-- Repeatable: `R__<description>.sql`. Runs after all versioned migrations whenever its SHA-256 checksum changes.
-
-## Directives
-
-Supported leading comment directives (must appear before the first SQL statement):
-
-| Directive | Values | Default |
-|---|---|---|
-| `-- pgway: transaction=<bool>` | `true`, `false` | `true` |
-| `-- pgway: lock_timeout=<dur>` | `0`, `<n>ms`, `<n>s`, `<n>m`/`<n>min`, `<n>h` | config default (unset) |
-| `-- pgway: statement_timeout=<dur>` | `0`, `<n>ms`, `<n>s`, `<n>m`/`<n>min`, `<n>h` | config default (unset) |
+- Versioned: `V<version>__<description>.sql` (e.g. `V1__schema.sql`, `V2__add_index.sql`). Versions compare numerically across segments (`V2 < V10`); duplicate numeric equivalents (`V1`, `V01`, `V1.0`) fail fast.
+- Repeatable: `R__<description>.sql`. Runs after versioned migrations whenever its SHA-256 checksum changes.
 
 ## Building and testing
 
-Requires JDK 27 and PostgreSQL 19+ server binaries (`postgres`, `initdb`, `pg_ctl`) on `PATH` or in standard Homebrew/PGDG locations (override with `-Dpgway.postgresBin=...`). Tests spin up a disposable, loopback-only PostgreSQL cluster and never touch existing local databases.
+Requires JDK 27 and PostgreSQL 19+ server binaries (`postgres`, `initdb`, `pg_ctl`).
 
 ```shell
 ./gradlew clean check releaseBundle

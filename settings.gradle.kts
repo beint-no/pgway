@@ -12,4 +12,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "pgway"
-include("core", "spring", "test-support")
+include("core", "spring", "gradle-plugin", "test-support")

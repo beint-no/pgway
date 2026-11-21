@@ -1,3 +1,4 @@
+import com.vanniktech.maven.publish.GradlePlugin
 import com.vanniktech.maven.publish.JavaLibrary
 import com.vanniktech.maven.publish.JavadocJar
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
@@ -35,7 +36,7 @@ subprojects {
                 showStandardStreams = false
             }
             if (providers.environmentVariable("CI").map(String::toBoolean).getOrElse(false)) {
-                outputs.cacheIf("Verify against the PostgreSQL 19 server installed on this runner") { false }
+                outputs.cacheIf("Verify against the PostgreSQL 19+ server installed on this runner") { false }
                 outputs.upToDateWhen { false }
             }
         }
@@ -52,26 +53,37 @@ subprojects {
         }
     }
 
-    if (name in setOf("core", "spring")) {
-        plugins.withId("java-library") {
+    if (name in setOf("core", "spring", "gradle-plugin")) {
+        val pluginId = if (name == "gradle-plugin") "java-gradle-plugin" else "java-library"
+        plugins.withId(pluginId) {
             apply(plugin = "com.vanniktech.maven.publish")
             extensions.configure<MavenPublishBaseExtension> {
                 publishToMavenCentral()
                 if (providers.gradleProperty("signingInMemoryKey").isPresent) {
                     signAllPublications()
                 }
-                configure(
-                    JavaLibrary(
-                        javadocJar = JavadocJar.Javadoc(),
-                        sourcesJar = SourcesJar.Sources(),
-                    ),
-                )
+                if (project.name == "gradle-plugin") {
+                    configure(
+                        GradlePlugin(
+                            javadocJar = JavadocJar.Javadoc(),
+                            sourcesJar = SourcesJar.Sources(),
+                        ),
+                    )
+                } else {
+                    configure(
+                        JavaLibrary(
+                            javadocJar = JavadocJar.Javadoc(),
+                            sourcesJar = SourcesJar.Sources(),
+                        ),
+                    )
+                }
                 pom {
                     name.set("Pgway ${project.name}")
                     description.set(
                         when (project.name) {
                             "core" -> "Zero-dependency PostgreSQL 19+ schema migration engine for JDK 27."
-                            "spring" -> "Spring Boot 4 auto-configuration for Pgway PostgreSQL 19+ migrations."
+                            "spring" -> "Convention-first Spring Boot 4 auto-configuration for Pgway PostgreSQL 19+ migrations."
+                            "gradle-plugin" -> "Gradle plugin that verifies Pgway SQL migrations against PostgreSQL 19+ at build time."
                             else -> "Modern PostgreSQL 19+ schema migrations for JDK 27."
                         },
                     )
@@ -119,6 +131,7 @@ tasks.register<Zip>("releaseBundle") {
     dependsOn(
         ":core:publishAllPublicationsToReleaseRepository",
         ":spring:publishAllPublicationsToReleaseRepository",
+        ":gradle-plugin:publishAllPublicationsToReleaseRepository",
     )
     from(layout.buildDirectory.dir("repository"))
     destinationDirectory.set(layout.buildDirectory.dir("distributions"))

@@ -5,11 +5,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
-import java.util.List;
 import java.util.Objects;
-import java.util.stream.Collectors;
 
-/** Internal PostgreSQL 19 identifier quoting, duration formatting, and lock-key helpers. */
+/** Internal PostgreSQL 19+ identifier quoting, duration formatting, and lock-key helpers. */
 final class PgIdentifiers {
     private static final int PG_MAX_IDENTIFIER_BYTES = 63;
 
@@ -38,20 +36,6 @@ final class PgIdentifiers {
 
     static String qualifiedTable(String schema, String table) {
         return quote(schema) + "." + quote(table);
-    }
-
-    static String formatSearchPath(List<String> schemas) {
-        return schemas.stream().map(PgIdentifiers::quote).collect(Collectors.joining(", "));
-    }
-
-    static String versionIndexName(String table) {
-        String suffix = "_ver_uniq_idx";
-        int maxBase = PG_MAX_IDENTIFIER_BYTES - suffix.length();
-        String base = table;
-        while (base.getBytes(StandardCharsets.UTF_8).length > maxBase) {
-            base = base.substring(0, base.length() - 1);
-        }
-        return base + suffix;
     }
 
     static long deriveAdvisoryLockKey(String schema, String table) {

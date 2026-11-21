@@ -13,26 +13,19 @@ import org.springframework.core.Ordered;
  * {@link InitializingBean} that runs {@link Pgway#migrate()} during Spring Boot startup
  * before dependent database beans (such as JPA {@code EntityManagerFactory} or {@code JdbcTemplate}) initialize.
  */
-public class PgwayMigrationInitializer implements InitializingBean, Ordered {
+public final class PgwayMigrationInitializer implements InitializingBean, Ordered {
     private static final Logger log = LoggerFactory.getLogger(PgwayMigrationInitializer.class);
 
     private final Pgway pgway;
-    private final PgwayMigrationStrategy strategy;
-    private int order = 0;
 
-    public PgwayMigrationInitializer(Pgway pgway, PgwayMigrationStrategy strategy) {
+    public PgwayMigrationInitializer(Pgway pgway) {
         this.pgway = Objects.requireNonNull(pgway, "pgway must not be null");
-        this.strategy = strategy;
     }
 
     @Override
     public void afterPropertiesSet() {
-        if (strategy != null) {
-            strategy.migrate(pgway);
-            return;
-        }
         MigrationResult result = pgway.migrate();
-        String schema = pgway.config().defaultSchema();
+        String schema = pgway.config().schema();
         if (result.baselined()) {
             log.info("Pgway baselined schema '{}' at version {}", schema, result.currentVersion());
         }
@@ -64,10 +57,6 @@ public class PgwayMigrationInitializer implements InitializingBean, Ordered {
 
     @Override
     public int getOrder() {
-        return order;
-    }
-
-    public void setOrder(int order) {
-        this.order = order;
+        return 0;
     }
 }

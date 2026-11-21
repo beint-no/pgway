@@ -30,7 +30,7 @@ class PgwayFailureAndValidationTest {
 
         Pgway pgwayBroken = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(broken)
+            .source(broken)
             .create();
 
         PgwayMigrationException ex = assertThrows(PgwayMigrationException.class, pgwayBroken::migrate);
@@ -60,7 +60,7 @@ class PgwayFailureAndValidationTest {
         // Now fix script (using IF NOT EXISTS for the already-committed first statement) and re-run
         Pgway pgwayFixed = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__base.sql", "CREATE TABLE items (id int PRIMARY KEY);",
                 "V2__concurrent_broken.sql", """
                     -- pgway: transaction=false
@@ -81,7 +81,7 @@ class PgwayFailureAndValidationTest {
 
         Pgway initial = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__one.sql", "CREATE TABLE t1 (id int);",
                 "V2__two.sql", "CREATE TABLE t2 (id int);"
             )))
@@ -91,7 +91,7 @@ class PgwayFailureAndValidationTest {
         // Mutate V1 and drop V2 -> both CHECKSUM_MISMATCH and MISSING_MIGRATION reported
         Pgway drifted = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__one.sql", "CREATE TABLE t1 (id int, extra text);"
             )))
             .create();
@@ -109,7 +109,7 @@ class PgwayFailureAndValidationTest {
         // Restore V2 and realign V1 checksum with repair(true)
         Pgway realign = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__one.sql", "CREATE TABLE t1 (id int, extra text);",
                 "V2__two.sql", "CREATE TABLE t2 (id int);"
             )))
@@ -121,13 +121,13 @@ class PgwayFailureAndValidationTest {
     }
 
     @Test
-    void rejectsOutOfOrderByDefaultAndAllowsWhenEnabled() throws Exception {
+    void alwaysRejectsOutOfOrderMigrations() throws Exception {
         Pg19TestCluster pg = Pg19TestCluster.shared();
         String db = pg.createDatabase("out_of_order");
 
         Pgway initial = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__one.sql", "CREATE TABLE t1 (id int);",
                 "V3__three.sql", "CREATE TABLE t3 (id int);"
             )))
@@ -142,20 +142,10 @@ class PgwayFailureAndValidationTest {
 
         Pgway strict = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .addSource(withV2)
+            .source(withV2)
             .create();
         assertThrows(PgwayValidationException.class, strict::migrate);
         assertEquals(MigrationState.OUT_OF_ORDER, strict.info().get(2).state());
-
-        Pgway permissive = Pgway.configure()
-            .dataSource(pg.url(db), pg.user(), pg.password())
-            .outOfOrder(true)
-            .addSource(withV2)
-            .create();
-        MigrationResult res = permissive.migrate();
-        assertEquals(1, res.appliedCount());
-        assertEquals(MigrationVersion.parse("2"), res.applied().get(0).version());
-        assertTrue(permissive.validate().valid());
     }
 
     @Test
@@ -172,7 +162,7 @@ class PgwayFailureAndValidationTest {
             .dataSource(pg.url(db), pg.user(), pg.password())
             .baselineOnMigrate(true)
             .baselineVersion("2")
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__old.sql", "CREATE TABLE should_not_run_1 (id int);",
                 "V2__old.sql", "CREATE TABLE should_not_run_2 (id int);",
                 "V3__new.sql", "CREATE TABLE should_run_3 (id int);"
@@ -210,7 +200,7 @@ class PgwayFailureAndValidationTest {
             .dataSource(pg.url(db), pg.user(), pg.password())
             .baselineOnMigrate(true)
             .baselineVersion("2")
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of(
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
                 "V1__one.sql", "CREATE TABLE from_v1 (id int PRIMARY KEY);",
                 "V2__two.sql", "CREATE TABLE from_v2 (id int PRIMARY KEY);",
                 "V3__three.sql", "CREATE TABLE from_v3 (id int PRIMARY KEY);"

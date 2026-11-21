@@ -134,16 +134,12 @@ final class SchemaHistoryRepository {
         }
     }
 
-    static void ensureSchemas(Connection connection, List<String> schemas, String defaultSchema) throws SQLException {
-        List<String> toCreate = new ArrayList<>();
-        if (!schemas.contains(defaultSchema)) {
-            toCreate.add(defaultSchema);
+    static void ensureSchema(Connection connection, String schema) throws SQLException {
+        if (PgwayConfig.DEFAULT_SCHEMA.equals(schema)) {
+            return;
         }
-        toCreate.addAll(schemas);
         try (Statement stmt = connection.createStatement()) {
-            for (String schema : toCreate) {
-                stmt.execute("CREATE SCHEMA IF NOT EXISTS " + PgIdentifiers.quote(schema));
-            }
+            stmt.execute("CREATE SCHEMA IF NOT EXISTS " + PgIdentifiers.quote(schema));
         }
     }
 
@@ -207,7 +203,7 @@ final class SchemaHistoryRepository {
 
     static void createHistoryTable(Connection connection, String schema, String table) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
-        String idxName = PgIdentifiers.quote(PgIdentifiers.versionIndexName(table));
+        String idxName = PgIdentifiers.quote(table + "_ver_uniq_idx");
         try (Statement stmt = connection.createStatement()) {
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS %s (

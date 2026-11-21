@@ -48,7 +48,7 @@ class PgwayConcurrencyTest {
                     Pgway pgway = Pgway.configure()
                         .dataSource(pg.url(db), pg.user(), pg.password())
                         .lockTimeout(Duration.ofSeconds(15))
-                        .addSource(source)
+                        .source(source)
                         .create();
                     ready.countDown();
                     go.await();
@@ -83,19 +83,19 @@ class PgwayConcurrencyTest {
 
         Pgway schemaA = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .schemas("schema_a")
+            .schema("schema_a")
             .lockTimeout(Duration.ofMillis(250))
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of("V1__a.sql", "CREATE TABLE a (id int);")))
+            .source(InMemoryMigrationSource.ofStrings(Map.of("V1__a.sql", "CREATE TABLE a (id int);")))
             .create();
 
         Pgway schemaB = Pgway.configure()
             .dataSource(pg.url(db), pg.user(), pg.password())
-            .schemas("schema_b")
+            .schema("schema_b")
             .lockTimeout(Duration.ofMillis(250))
-            .addSource(InMemoryMigrationSource.ofStrings(Map.of("V1__b.sql", "CREATE TABLE b (id int);")))
+            .source(InMemoryMigrationSource.ofStrings(Map.of("V1__b.sql", "CREATE TABLE b (id int);")))
             .create();
 
-        long keyA = schemaA.config().resolvedAdvisoryLockKey();
+        long keyA = schemaA.config().advisoryLockKey();
         try (Connection holder = pg.connect(db)) {
             try (PreparedStatement ps = holder.prepareStatement("SELECT pg_advisory_lock(?)")) {
                 ps.setLong(1, keyA);
@@ -147,7 +147,7 @@ class PgwayConcurrencyTest {
                         .dataSource(pg.url(db), pg.user(), pg.password())
                         .baselineOnMigrate(true)
                         .baselineVersion("1")
-                        .addSource(source)
+                        .source(source)
                         .create();
                     ready.countDown();
                     go.await();
