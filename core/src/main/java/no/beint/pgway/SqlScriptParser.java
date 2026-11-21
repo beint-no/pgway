@@ -343,25 +343,25 @@ public final class SqlScriptParser {
                 while (i < len && isIdentCont(normalizedSql.charAt(i))) {
                     i++;
                 }
-                String upper = normalizedSql.substring(wordStart, i).toUpperCase(Locale.ROOT);
+                int wordLen = i - wordStart;
                 if (firstKeyword == null) {
-                    firstKeyword = upper;
+                    firstKeyword = normalizedSql.substring(wordStart, i).toUpperCase(Locale.ROOT);
                 } else if (secondKeyword == null) {
-                    secondKeyword = upper;
+                    secondKeyword = normalizedSql.substring(wordStart, i).toUpperCase(Locale.ROOT);
                 }
 
                 if (parenDepth == 0) {
-                    if (prevWasBegin && "ATOMIC".equals(upper)) {
+                    if (prevWasBegin && wordLen == 6 && normalizedSql.regionMatches(true, wordStart, "ATOMIC", 0, 6)) {
                         atomicDepth++;
                         prevWasBegin = false;
-                    } else if ("BEGIN".equals(upper)) {
+                    } else if (wordLen == 5 && normalizedSql.regionMatches(true, wordStart, "BEGIN", 0, 5)) {
                         prevWasBegin = true;
                     } else {
                         prevWasBegin = false;
                         if (atomicDepth > 0) {
-                            if ("CASE".equals(upper)) {
+                            if (wordLen == 4 && normalizedSql.regionMatches(true, wordStart, "CASE", 0, 4)) {
                                 caseDepth++;
-                            } else if ("END".equals(upper)) {
+                            } else if (wordLen == 3 && normalizedSql.regionMatches(true, wordStart, "END", 0, 3)) {
                                 if (caseDepth > 0) {
                                     caseDepth--;
                                 } else {

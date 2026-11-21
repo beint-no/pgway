@@ -7,8 +7,6 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
@@ -31,7 +29,7 @@ public final class PgwayConfig {
     public static final Duration DEFAULT_LOCK_TIMEOUT = Duration.ofSeconds(30);
 
     private final DataSource dataSource;
-    private final List<MigrationSource> sources;
+    private final MigrationSource source;
     private final String schema;
     private final Duration lockTimeout;
     private final Duration migrationLockTimeout;
@@ -40,9 +38,9 @@ public final class PgwayConfig {
 
     private PgwayConfig(Builder builder) {
         this.dataSource = Objects.requireNonNull(builder.dataSource, "dataSource must be configured");
-        this.sources = builder.sources.isEmpty()
-            ? List.of(new ClasspathMigrationSource(DEFAULT_CLASSPATH_LOCATION))
-            : List.copyOf(builder.sources);
+        this.source = builder.source != null
+            ? builder.source
+            : new ClasspathMigrationSource(DEFAULT_CLASSPATH_LOCATION);
         this.schema = PgIdentifiers.validateIdentifier(builder.schema, "schema");
         this.lockTimeout = validateNonNegative(builder.lockTimeout, "lockTimeout");
         this.migrationLockTimeout = builder.migrationLockTimeout == null
@@ -62,8 +60,8 @@ public final class PgwayConfig {
         return dataSource;
     }
 
-    public List<MigrationSource> sources() {
-        return sources;
+    public MigrationSource source() {
+        return source;
     }
 
     public String schema() {
@@ -100,7 +98,7 @@ public final class PgwayConfig {
 
     public static final class Builder {
         private DataSource dataSource;
-        private final List<MigrationSource> sources = new ArrayList<>();
+        private MigrationSource source;
         private String schema = DEFAULT_SCHEMA;
         private Duration lockTimeout = DEFAULT_LOCK_TIMEOUT;
         private Duration migrationLockTimeout;
@@ -120,42 +118,12 @@ public final class PgwayConfig {
         }
 
         public Builder directory(Path directory) {
-            this.sources.clear();
-            this.sources.add(new FilesystemMigrationSource(directory));
-            return this;
-        }
-
-        public Builder directories(Path... directories) {
-            this.sources.clear();
-            for (Path dir : directories) {
-                this.sources.add(new FilesystemMigrationSource(dir));
-            }
-            return this;
-        }
-
-        public Builder classpath(String resourcePath) {
-            this.sources.clear();
-            this.sources.add(new ClasspathMigrationSource(resourcePath));
-            return this;
-        }
-
-        public Builder classpath(String resourcePath, ClassLoader classLoader) {
-            this.sources.clear();
-            this.sources.add(new ClasspathMigrationSource(resourcePath, classLoader));
+            this.source = new FilesystemMigrationSource(directory);
             return this;
         }
 
         public Builder source(MigrationSource source) {
-            this.sources.clear();
-            this.sources.add(Objects.requireNonNull(source, "source must not be null"));
-            return this;
-        }
-
-        public Builder sources(List<MigrationSource> sources) {
-            this.sources.clear();
-            for (MigrationSource source : sources) {
-                this.sources.add(Objects.requireNonNull(source, "source must not be null"));
-            }
+            this.source = Objects.requireNonNull(source, "source must not be null");
             return this;
         }
 

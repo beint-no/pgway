@@ -17,7 +17,7 @@ Requires **JDK 27** and **PostgreSQL 19 or higher**.
 - **Migrations location:** always `src/main/resources/db/migration` (`classpath*:db/migration/**/*.sql`).
 - **Naming:** strictly positive integer versions without leading zeros: `V1__schema.sql`, `V2__add_index.sql`, ... (`^V([1-9][0-9]*)__(.+)\.sql$`). Non-`.sql` files (such as `AGENTS.md`) are ignored.
 - **History table (`pgway_history`):** compact, column-Tetris aligned table in the target schema (default `public`; non-`public` schemas are created automatically) with `version integer PRIMARY KEY` and 32-byte raw SHA-256 `checksum bytea`.
-- **Fast startup:** version check, session capture, bounded advisory lock, and table lookup collapse into a single PostgreSQL round-trip (3 round-trips total on steady-state startups, skipping session-setting restore when 0 migrations run).
+- **Fast lock-free startup:** steady-state up-to-date startups complete via a lock-free read-only check without lexing already-applied SQL scripts or taking an advisory lock; pending migrations serialize under a bounded session advisory lock.
 - **Atomic transactional DDL:** transactional migrations commit their `pgway_history` row in the **same transaction** as the DDL. Failed transactional migrations roll back cleanly without leaving dirty history rows.
 - **Inline `-- pgway:` directives:** configure non-transactional execution (`CREATE INDEX CONCURRENTLY`) and per-migration timeouts directly at the top of the `.sql` file (no `.sql.conf` sidecars):
   ```sql
@@ -37,7 +37,7 @@ Requires **JDK 27** and **PostgreSQL 19 or higher**.
 
 ```kotlin
 plugins {
-    id("no.beint.pgway") version "3.0.1"
+    id("no.beint.pgway") version "3.0.2"
 }
 ```
 
@@ -53,7 +53,7 @@ pgway {
 
 ### Spring Boot 4 (`no.beint.pgway:spring`)
 
-Add `implementation("no.beint.pgway:spring:3.0.1")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
+Add `implementation("no.beint.pgway:spring:3.0.2")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
 
 | Property | Default | Purpose |
 |---|---|---|

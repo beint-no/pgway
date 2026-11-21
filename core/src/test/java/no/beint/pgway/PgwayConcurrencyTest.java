@@ -117,4 +117,47 @@ class PgwayConcurrencyTest {
 
         assertEquals(1, schemaA.migrate().appliedCount());
     }
+
+    @Test
+    void upToDateMigrateTakesLockFreeFastPathWithoutWaitingOnAdvisoryLock() throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("lock_free_fast_path");
+
+        Pgway v1 = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .lockTimeout(Duration.ofMillis(150))
+            .source(InMemoryMigrationSource.ofStrings(Map.of("V1__init.sql", "CREATE TABLE items (id int PRIMARY KEY);")))
+            .create();
+        assertEquals(1, v1.migrate().appliedCount());
+
+        long lockKey = v1.config().advisoryLockKey();
+        try (Connection holder = pg.connect(db)) {
+            try (PreparedStatement ps = holder.prepareStatement("SELECT pg_advisory_lock(?)")) {
+                ps.setLong(1, lockKey);
+                ps.executeQuery().close();
+            }
+
+            // Up-to-date migrate() must return immediately via the lock-free read-only fast path!
+            MigrationResult fast = v1.migrate();
+            assertEquals(0, fast.appliedCount());
+            assertEquals(1, fast.skippedCount());
+            assertEquals(1, fast.currentVersion());
+
+            // Adding a pending V2 must fall through to the advisory lock and time out cleanly.
+            Pgway v2 = Pgway.configure()
+                .dataSource(pg.url(db), pg.user(), pg.password())
+                .lockTimeout(Duration.ofMillis(150))
+                .source(InMemoryMigrationSource.ofStrings(Map.of(
+                    "V1__init.sql", "CREATE TABLE items (id int PRIMARY KEY);",
+                    "V2__more.sql", "ALTER TABLE items ADD COLUMN note text;"
+                )))
+                .create();
+            assertThrows(PgwayLockException.class, v2::migrate);
+
+            try (PreparedStatement ps = holder.prepareStatement("SELECT pg_advisory_unlock(?)")) {
+                ps.setLong(1, lockKey);
+                ps.executeQuery().close();
+            }
+        }
+    }
 }

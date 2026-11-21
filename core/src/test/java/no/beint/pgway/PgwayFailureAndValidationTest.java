@@ -254,4 +254,37 @@ class PgwayFailureAndValidationTest {
         assertEquals(1, res.appliedCount());
         assertEquals(1, res.currentVersion());
     }
+
+    @Test
+    void brokenLaterPendingScriptFailsBeforeExecutingEarlierPendingMigration() throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("lazy_parse_fail_fast");
+
+        Pgway v1 = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
+                "V1__init.sql", "CREATE TABLE base_t (id int PRIMARY KEY);"
+            )))
+            .create();
+        assertEquals(1, v1.migrate().appliedCount());
+
+        Pgway withBrokenV3 = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
+                "V1__init.sql", "CREATE TABLE base_t (id int PRIMARY KEY);",
+                "V2__valid_pending.sql", "CREATE TABLE should_not_exist (id int PRIMARY KEY);",
+                "V3__broken_directive.sql", "-- pgway: invalid_key=1\nSELECT 1;"
+            )))
+            .create();
+
+        PgwayValidationException ex = assertThrows(PgwayValidationException.class, withBrokenV3::migrate);
+        assertEquals(ValidationErrorCode.INVALID_SQL_SCRIPT, ex.issues().get(0).code());
+        assertEquals(3, ex.issues().get(0).version());
+
+        try (Connection c = pg.connect(db); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT to_regclass('public.should_not_exist')")) {
+            assertTrue(rs.next());
+            assertEquals(null, rs.getString(1), "V2 must not execute when pending V3 fails SQL/directive parsing");
+        }
+    }
 }

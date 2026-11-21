@@ -27,7 +27,7 @@ final class SchemaHistoryRepository {
 
     record SessionSettings(String searchPath, String lockTimeout, String statementTimeout) {}
 
-    record LockedSessionInfo(SessionSettings baseSettings, boolean historyExists) {}
+    record SchemaProbe(boolean historyExists, boolean hasUserObjects) {}
 
     static boolean openReadOnlySession(Connection connection, String schema, String table) {
         String sql = """
@@ -56,15 +56,12 @@ final class SchemaHistoryRepository {
 
     /**
      * In a single atomic round-trip: checks PostgreSQL 19+, captures baseline session settings,
-     * bounds lock acquisition with {@code SET LOCAL lock_timeout}, acquires the session advisory lock,
-     * and checks whether {@code pgway_history} already exists.
+     * bounds lock acquisition with {@code SET LOCAL lock_timeout}, and acquires the session advisory lock.
      */
-    static LockedSessionInfo openLockedSession(
+    static SessionSettings openLockedSession(
             Connection connection,
             long lockKey,
-            Duration lockTimeout,
-            String schema,
-            String table) throws SQLException {
+            Duration lockTimeout) throws SQLException {
         String sql = """
             WITH cfg AS MATERIALIZED (
                 SELECT current_setting('server_version_num')::int AS ver_num,
@@ -79,8 +76,7 @@ final class SchemaHistoryRepository {
                    search_path,
                    lock_timeout,
                    statement_timeout,
-                   CASE WHEN ver_num >= 190000 THEN pg_advisory_lock(?) END,
-                   to_regclass(?) IS NOT NULL AS history_exists
+                   CASE WHEN ver_num >= 190000 THEN pg_advisory_lock(?) END
             FROM cfg
             """;
         connection.setAutoCommit(false);
@@ -88,7 +84,6 @@ final class SchemaHistoryRepository {
             try (PreparedStatement ps = connection.prepareStatement(sql)) {
                 ps.setString(1, PgIdentifiers.formatPgDuration(lockTimeout));
                 ps.setLong(2, lockKey);
-                ps.setString(3, PgIdentifiers.qualifiedTable(schema, table));
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new PgwayUnsupportedDatabaseException(-1, "", "Unable to determine PostgreSQL server version");
@@ -101,9 +96,8 @@ final class SchemaHistoryRepository {
                         rs.getString(4),
                         rs.getString(5)
                     );
-                    boolean historyExists = rs.getBoolean(7);
                     connection.commit();
-                    return new LockedSessionInfo(settings, historyExists);
+                    return settings;
                 }
             }
         } catch (PgwayUnsupportedDatabaseException e) {
@@ -130,6 +124,55 @@ final class SchemaHistoryRepository {
             throw e;
         } finally {
             connection.setAutoCommit(true);
+        }
+    }
+
+    /**
+     * Probes history table existence (and non-extension user objects only if absent) in a fresh snapshot
+     * AFTER the advisory lock is held.
+     */
+    static SchemaProbe probeSchemaAfterLock(Connection connection, String schema, String table) throws SQLException {
+        String sql = """
+            WITH reg AS (
+                SELECT to_regclass(?) IS NOT NULL AS history_exists
+            )
+            SELECT history_exists,
+                   CASE WHEN NOT history_exists THEN (
+                       EXISTS (
+                           SELECT 1
+                           FROM pg_catalog.pg_class c
+                           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                           WHERE n.nspname = ?
+                             AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM pg_catalog.pg_depend d
+                                 WHERE d.classid = 'pg_catalog.pg_class'::regclass
+                                   AND d.objid = c.oid
+                                   AND d.deptype = 'e'
+                             )
+                       ) OR EXISTS (
+                           SELECT 1
+                           FROM pg_catalog.pg_proc p
+                           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                           WHERE n.nspname = ?
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM pg_catalog.pg_depend d
+                                 WHERE d.classid = 'pg_catalog.pg_proc'::regclass
+                                   AND d.objid = p.oid
+                                   AND d.deptype = 'e'
+                             )
+                       )
+                   ) ELSE false END AS has_user_objects
+            FROM reg
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, PgIdentifiers.qualifiedTable(schema, table));
+            ps.setString(2, schema);
+            ps.setString(3, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return new SchemaProbe(rs.getBoolean(1), rs.getBoolean(2));
+            }
         }
     }
 
