@@ -74,6 +74,9 @@ public final class Pgway {
 
         return withLockedSession((connection, session) -> {
             if (!session.historyExists()) {
+                if (SchemaHistoryRepository.schemaHasUserObjects(connection, config.schema())) {
+                    throw new PgwayValidationException(nonEmptySchemaIssue());
+                }
                 connection.setAutoCommit(false);
                 try {
                     SchemaHistoryRepository.ensureSchemaAndHistoryTable(
@@ -200,6 +203,8 @@ public final class Pgway {
                     PgwayConfig.HISTORY_TABLE
                 );
                 issues.addAll(validateAgainstHistory(loaded.scripts(), history));
+            } else if (SchemaHistoryRepository.schemaHasUserObjects(connection, config.schema())) {
+                issues.add(nonEmptySchemaIssue());
             }
             return null;
         });
@@ -610,6 +615,18 @@ public final class Pgway {
         }
 
         return issues;
+    }
+
+    private ValidationIssue nonEmptySchemaIssue() {
+        return new ValidationIssue(
+            ValidationErrorCode.NON_EMPTY_SCHEMA_WITHOUT_HISTORY,
+            null,
+            0,
+            "Schema '" + config.schema() + "' already contains database objects but has no "
+                + PgIdentifiers.qualifiedTable(config.schema(), PgwayConfig.HISTORY_TABLE)
+                + " table. Refusing to replay migrations against a non-empty schema; "
+                + "seed pgway_history or call compactHistory() before migrating."
+        );
     }
 
     private static int elapsedMillis(long startNanos) {

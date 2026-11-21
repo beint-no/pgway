@@ -28,6 +28,7 @@ Requires **JDK 27** and **PostgreSQL 19 or higher**.
   ```
   Unknown, duplicate, or misplaced directives fail the build.
 - **JDK 27 `ScopedValue` context:** `Pgway.currentMigration()` exposes an immutable `MigrationContext` (`schema`, `version`, `script`, `checksum`, `startedAt`) to `MigrationListener`s with zero `ThreadLocal` leaks.
+- **Fail-closed on non-empty schemas:** if `pgway_history` does not exist and the target schema already contains user tables/objects, `migrate()` and `validate()` refuse to proceed instead of replaying `V1..Vn` against an existing database (extension-owned objects are ignored).
 - **Compaction instead of baseline:** when cutting over an existing database or squashing `V1..Vn` into a compacted `V1`, replace `pgway_history` with the single `V1` row (`pgway.compactHistory()` or a single SQL `INSERT`).
 
 ## Usage
@@ -36,7 +37,7 @@ Requires **JDK 27** and **PostgreSQL 19 or higher**.
 
 ```kotlin
 plugins {
-    id("no.beint.pgway") version "3.0.0"
+    id("no.beint.pgway") version "3.0.1"
 }
 ```
 
@@ -52,7 +53,7 @@ pgway {
 
 ### Spring Boot 4 (`no.beint.pgway:spring`)
 
-Add `implementation("no.beint.pgway:spring:3.0.0")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
+Add `implementation("no.beint.pgway:spring:3.0.1")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
 
 | Property | Default | Purpose |
 |---|---|---|

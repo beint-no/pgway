@@ -187,4 +187,71 @@ class PgwayFailureAndValidationTest {
         assertEquals(2, res.currentVersion());
         assertTrue(afterSquash.validate().valid());
     }
+
+    @Test
+    void refusesToReplayMigrationsAgainstNonEmptySchemaWithoutHistoryUntilSeeded() throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("non_empty_guard");
+
+        // Pre-existing table (e.g. production DB before cutover or pre-Pgway backup restore)
+        try (Connection c = pg.connect(db); Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE existing_data (id int PRIMARY KEY)");
+            s.execute("INSERT INTO existing_data VALUES (42)");
+        }
+
+        Pgway pgway = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
+                "V1__init.sql", "DELETE FROM existing_data; CREATE TABLE existing_data (id int PRIMARY KEY);",
+                "V2__new_table.sql", "CREATE TABLE added_after_cutover (id int PRIMARY KEY);"
+            )))
+            .create();
+
+        // Both validate() and migrate() fail closed
+        ValidationResult validation = pgway.validate();
+        assertFalse(validation.valid());
+        assertEquals(1, validation.issues().size());
+        assertEquals(ValidationErrorCode.NON_EMPTY_SCHEMA_WITHOUT_HISTORY, validation.issues().get(0).code());
+
+        PgwayValidationException ex = assertThrows(PgwayValidationException.class, pgway::migrate);
+        assertEquals(ValidationErrorCode.NON_EMPTY_SCHEMA_WITHOUT_HISTORY, ex.issues().get(0).code());
+
+        // Existing row untouched and pgway_history was NOT created
+        try (Connection c = pg.connect(db); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT (SELECT count(*) FROM existing_data), to_regclass('public.pgway_history')")) {
+            assertTrue(rs.next());
+            assertEquals(1, rs.getInt(1), "No migration SQL may execute when fail-closed guard trips");
+            assertEquals(null, rs.getString(2), "pgway_history must not be created when guard trips");
+        }
+
+        // After explicitly compacting/seeding history to V1, validate() passes and migrate() applies only V2
+        pgway.compactHistory();
+        assertTrue(pgway.validate().valid());
+        MigrationResult res = pgway.migrate();
+        assertEquals(1, res.appliedCount());
+        assertEquals(2, res.applied().get(0).version());
+    }
+
+    @Test
+    void allowsFreshMigrationWhenSchemaContainsOnlyExtensionObjects() throws Exception {
+        Pg19TestCluster pg = Pg19TestCluster.shared();
+        String db = pg.createDatabase("ext_only_empty");
+
+        // Pre-installed extension in public (adds extension-owned functions/types, no user objects)
+        try (Connection c = pg.connect(db); Statement s = c.createStatement()) {
+            s.execute("CREATE EXTENSION citext");
+        }
+
+        Pgway pgway = Pgway.configure()
+            .dataSource(pg.url(db), pg.user(), pg.password())
+            .source(InMemoryMigrationSource.ofStrings(Map.of(
+                "V1__init.sql", "CREATE TABLE accounts (id int PRIMARY KEY, email citext NOT NULL);"
+            )))
+            .create();
+
+        assertTrue(pgway.validate().valid());
+        MigrationResult res = pgway.migrate();
+        assertEquals(1, res.appliedCount());
+        assertEquals(1, res.currentVersion());
+    }
 }

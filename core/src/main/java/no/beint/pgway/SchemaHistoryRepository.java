@@ -198,6 +198,42 @@ final class SchemaHistoryRepository {
         }
     }
 
+    static boolean schemaHasUserObjects(Connection connection, String schema) throws SQLException {
+        String sql = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = ?
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_depend d
+                      WHERE d.classid = 'pg_catalog.pg_class'::regclass
+                        AND d.objid = c.oid
+                        AND d.deptype = 'e'
+                  )
+            ) OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc p
+                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_depend d
+                      WHERE d.classid = 'pg_catalog.pg_proc'::regclass
+                        AND d.objid = p.oid
+                        AND d.deptype = 'e'
+                  )
+            )
+            """;
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, schema);
+            ps.setString(2, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
     static void ensureSchemaAndHistoryTable(Connection connection, String schema, String table) throws SQLException {
         String qualified = PgIdentifiers.qualifiedTable(schema, table);
         try (Statement stmt = connection.createStatement()) {
