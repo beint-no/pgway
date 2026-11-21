@@ -18,28 +18,52 @@ import java.util.regex.Pattern;
 
 /**
  * Loads, strictly decodes, validates filenames ({@code V<positive-int>__<description>.sql}),
- * computes SHA-256 checksums, parses directives/SQL, and sorts migrations.
+ * computes SHA-256 checksums, lazily parses directives/SQL, and sorts migrations.
  */
 final class MigrationLoader {
     private static final Pattern VERSIONED_PATTERN = Pattern.compile("^V([1-9][0-9]*)__(.+)\\.sql$");
 
     private MigrationLoader() {}
 
-    record LoadedMigrations(List<MigrationScript> scripts, List<ValidationIssue> issues) {}
+    record DiscoveredMigration(
+            int version,
+            String description,
+            String scriptName,
+            String location,
+            String normalizedSql,
+            String checksum) {
 
-    static LoadedMigrations load(List<MigrationSource> sources) {
-        List<RawMigrationResource> rawResources = new ArrayList<>();
-        for (MigrationSource source : sources) {
-            try {
-                rawResources.addAll(source.load());
-            } catch (IOException e) {
-                throw new PgwayMigrationException("Failed to load migrations from source: " + e.getMessage(), e);
-            }
+        MigrationScript parse() {
+            SqlScriptParser.ParsedScript parsed = SqlScriptParser.parse(scriptName, normalizedSql);
+            return new MigrationScript(
+                version,
+                description,
+                scriptName,
+                location,
+                normalizedSql,
+                checksum,
+                parsed.directives(),
+                parsed.statements()
+            );
+        }
+    }
+
+    record LoadedHeaders(List<DiscoveredMigration> scripts, List<ValidationIssue> issues) {}
+
+    record LoadedScripts(List<MigrationScript> scripts, List<ValidationIssue> issues) {}
+
+    /** Loads filenames, validates UTF-8 and duplicate versions, and computes checksums without lexing SQL. */
+    static LoadedHeaders loadHeaders(MigrationSource source) {
+        List<RawMigrationResource> rawResources;
+        try {
+            rawResources = source.load();
+        } catch (IOException e) {
+            throw new PgwayMigrationException("Failed to load migrations from source: " + e.getMessage(), e);
         }
 
-        List<MigrationScript> scripts = new ArrayList<>(rawResources.size());
+        List<DiscoveredMigration> scripts = new ArrayList<>(rawResources.size());
         List<ValidationIssue> issues = new ArrayList<>();
-        Map<Integer, String> seenVersions = new HashMap<>();
+        Map<Integer, String> seenVersions = new HashMap<>(rawResources.size() * 2);
 
         for (RawMigrationResource resource : rawResources) {
             String fullName = resource.name();
@@ -104,19 +128,6 @@ final class MigrationLoader {
                 ? sha256Hex(rawBytes)
                 : sha256Hex(normalizedSql);
 
-            SqlScriptParser.ParsedScript parsed;
-            try {
-                parsed = SqlScriptParser.parse(fullName, normalizedSql);
-            } catch (PgwaySqlParseException e) {
-                issues.add(new ValidationIssue(
-                    ValidationErrorCode.INVALID_SQL_SCRIPT,
-                    fullName,
-                    version,
-                    e.getMessage()
-                ));
-                continue;
-            }
-
             String previous = seenVersions.putIfAbsent(version, fullName);
             if (previous != null) {
                 issues.add(new ValidationIssue(
@@ -128,20 +139,38 @@ final class MigrationLoader {
                 continue;
             }
 
-            scripts.add(new MigrationScript(
+            scripts.add(new DiscoveredMigration(
                 version,
                 description,
                 fullName,
                 resource.location(),
                 normalizedSql,
-                checksum,
-                parsed.directives(),
-                parsed.statements()
+                checksum
             ));
         }
 
-        scripts.sort(Comparator.comparingInt(MigrationScript::version));
-        return new LoadedMigrations(List.copyOf(scripts), List.copyOf(issues));
+        scripts.sort(Comparator.comparingInt(DiscoveredMigration::version));
+        return new LoadedHeaders(List.copyOf(scripts), List.copyOf(issues));
+    }
+
+    /** Loads and eagerly parses directives and SQL statements for every migration script. */
+    static LoadedScripts loadAndParseAll(MigrationSource source) {
+        LoadedHeaders headers = loadHeaders(source);
+        List<MigrationScript> scripts = new ArrayList<>(headers.scripts().size());
+        List<ValidationIssue> issues = new ArrayList<>(headers.issues());
+        for (DiscoveredMigration discovered : headers.scripts()) {
+            try {
+                scripts.add(discovered.parse());
+            } catch (PgwaySqlParseException e) {
+                issues.add(new ValidationIssue(
+                    ValidationErrorCode.INVALID_SQL_SCRIPT,
+                    discovered.scriptName(),
+                    discovered.version(),
+                    e.getMessage()
+                ));
+            }
+        }
+        return new LoadedScripts(List.copyOf(scripts), List.copyOf(issues));
     }
 
     static String descriptionFromScriptName(String scriptName) {

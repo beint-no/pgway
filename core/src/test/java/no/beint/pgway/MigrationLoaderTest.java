@@ -10,7 +10,6 @@ import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Map;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
@@ -47,7 +46,7 @@ class MigrationLoaderTest {
         Files.writeString(tempDir.resolve("V10__tenth.sql"), "SELECT 10;");
         Files.writeString(tempDir.resolve("V1__first.sql"), "SELECT 1;");
 
-        var loaded = MigrationLoader.load(List.of(new FilesystemMigrationSource(tempDir)));
+        var loaded = MigrationLoader.loadAndParseAll(new FilesystemMigrationSource(tempDir));
         assertTrue(loaded.issues().isEmpty());
         assertEquals(3, loaded.scripts().size());
         assertEquals(1, loaded.scripts().get(0).version());
@@ -58,7 +57,7 @@ class MigrationLoaderTest {
 
     @Test
     void rejectsInvalidFilenamesLeadingZerosNonIntegerVersionsAndDuplicates() {
-        var loaded = MigrationLoader.load(List.of(InMemoryMigrationSource.ofStrings(Map.of(
+        var loaded = MigrationLoader.loadAndParseAll(InMemoryMigrationSource.ofStrings(Map.of(
             "V1__a.sql", "SELECT 1;",
             "sub/V1__dup.sql", "SELECT 1;",
             "V01__leading_zero.sql", "SELECT 1;",
@@ -66,7 +65,7 @@ class MigrationLoaderTest {
             "R__repeatable_not_supported.sql", "SELECT 1;",
             "bad_migration.sql", "SELECT 1;",
             "V2_single_underscore.sql", "SELECT 2;"
-        ))));
+        )));
         assertFalse(loaded.issues().isEmpty());
         assertTrue(loaded.issues().stream().anyMatch(i -> i.code() == ValidationErrorCode.DUPLICATE_VERSION));
         assertEquals(5, loaded.issues().stream().filter(i -> i.code() == ValidationErrorCode.INVALID_FILENAME).count());
@@ -74,18 +73,18 @@ class MigrationLoaderTest {
 
     @Test
     void normalizesLineEndingsAndBomForChecksumsAndRejectsInvalidUtf8() {
-        var lf = MigrationLoader.load(List.of(InMemoryMigrationSource.ofStrings(Map.of(
+        var lf = MigrationLoader.loadAndParseAll(InMemoryMigrationSource.ofStrings(Map.of(
             "V1__init.sql", "CREATE TABLE t (id int);\n"
-        ))));
-        var crlfWithBom = MigrationLoader.load(List.of(InMemoryMigrationSource.ofStrings(Map.of(
+        )));
+        var crlfWithBom = MigrationLoader.loadAndParseAll(InMemoryMigrationSource.ofStrings(Map.of(
             "V1__init.sql", "\uFEFFCREATE TABLE t (id int);\r\n"
-        ))));
+        )));
         assertEquals(lf.scripts().get(0).checksum(), crlfWithBom.scripts().get(0).checksum());
         assertEquals(64, lf.scripts().get(0).checksum().length());
 
-        var invalidUtf8 = MigrationLoader.load(List.of(InMemoryMigrationSource.ofBytes(Map.of(
+        var invalidUtf8 = MigrationLoader.loadAndParseAll(InMemoryMigrationSource.ofBytes(Map.of(
             "V1__bad_utf8.sql", new byte[] {(byte) 0xFF, (byte) 0xFE, 0x41}
-        ))));
+        )));
         assertEquals(1, invalidUtf8.issues().size());
         assertEquals(ValidationErrorCode.INVALID_UTF8, invalidUtf8.issues().get(0).code());
     }
@@ -109,7 +108,7 @@ class MigrationLoaderTest {
 
         try (URLClassLoader loader = new URLClassLoader(new URL[] {jarPath.toUri().toURL()}, null)) {
             var source = new ClasspathMigrationSource("db/migration", loader);
-            var loaded = MigrationLoader.load(List.of(source));
+            var loaded = MigrationLoader.loadAndParseAll(source);
             assertTrue(loaded.issues().isEmpty());
             assertEquals(2, loaded.scripts().size());
             assertEquals("V1__from_jar.sql", loaded.scripts().get(0).scriptName());
@@ -124,7 +123,7 @@ class MigrationLoaderTest {
         }
         try (URLClassLoader loader = new URLClassLoader(new URL[] {strippedJar.toUri().toURL()}, null)) {
             var source = new ClasspathMigrationSource("db/migration", loader);
-            var loaded = MigrationLoader.load(List.of(source));
+            var loaded = MigrationLoader.loadAndParseAll(source);
             assertTrue(loaded.issues().isEmpty());
             assertEquals(1, loaded.scripts().size());
             assertEquals("V1__no_dir_entry.sql", loaded.scripts().get(0).scriptName());

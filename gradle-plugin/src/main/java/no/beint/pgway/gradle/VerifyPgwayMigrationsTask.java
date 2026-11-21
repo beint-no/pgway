@@ -3,9 +3,13 @@ package no.beint.pgway.gradle;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import no.beint.pgway.FilesystemMigrationSource;
 import no.beint.pgway.MigrationResult;
+import no.beint.pgway.MigrationSource;
 import no.beint.pgway.Pgway;
 import no.beint.pgway.PgwayValidationException;
+import no.beint.pgway.RawMigrationResource;
 import no.beint.pgway.ValidationResult;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.GradleException;
@@ -47,8 +51,17 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
         Path migrationsPath = getMigrationsDir().get().getAsFile().toPath();
         String schema = getSchema().get();
 
+        // Read migration files from disk once and reuse the snapshot across all verification steps.
+        List<RawMigrationResource> snapshot;
+        try {
+            snapshot = new FilesystemMigrationSource(migrationsPath).load();
+        } catch (IOException e) {
+            throw new GradleException("Failed to read migrations from " + migrationsPath.toAbsolutePath() + ": " + e.getMessage(), e);
+        }
+        MigrationSource cachedSource = () -> snapshot;
+
         // 1. Offline validation: filenames, UTF-8, duplicates, directives, SQL lexing
-        ValidationResult offline = Pgway.validateDirectory(migrationsPath);
+        ValidationResult offline = Pgway.validateSource(cachedSource);
         if (!offline.valid()) {
             throw new PgwayValidationException(offline.issues());
         }
@@ -58,7 +71,7 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
             Pgway pgway = Pgway.configure()
                 .dataSource(cluster.dataSource())
                 .schema(schema)
-                .directory(migrationsPath)
+                .source(cachedSource)
                 .create();
 
             MigrationResult first = pgway.migrate();
