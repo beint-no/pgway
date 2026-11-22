@@ -2259,10 +2259,11 @@ final class SchemaCompactor {
                 boolean hasExprs = rs.getBoolean(6);
                 List<String> simpleCols = null;
                 if (!hasExprs && nKeyAtts > 0 && indKey.length >= nKeyAtts) {
-                    List<String> cols = new ArrayList<>(nKeyAtts);
+                    // PostgreSQL's ChooseIndexNameAddition includes both key and INCLUDE columns in default index names.
+                    List<String> cols = new ArrayList<>(indKey.length);
                     boolean allReal = true;
-                    for (int k = 0; k < nKeyAtts; k++) {
-                        ColumnDef col = table.columnByNum(indKey[k]);
+                    for (short attNum : indKey) {
+                        ColumnDef col = table.columnByNum(attNum);
                         if (col == null) {
                             allReal = false;
                             break;
