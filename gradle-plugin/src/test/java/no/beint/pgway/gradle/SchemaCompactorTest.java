@@ -273,4 +273,38 @@ class SchemaCompactorTest {
         assertTrue(sql.contains("WHERE status NOT IN ('FAILED', 'REVERSED')"), sql);
         assertTrue(sql.contains("NOT VALID;"), sql);
     }
+
+    @Test
+    void breaksFkCyclesAtHubTablesSoDownstreamChildrenInlineReferences(@TempDir Path dir) throws Exception {
+        // tenants <-> companies is a 2-table cycle; a_child_1..a_child_5 sort alphabetically BEFORE
+        // tenants and depend on tenants. Cycle-breaking must pick the hub (tenants), NOT a_child_1,
+        // so all 5 child tables inline REFERENCES tenants and only 1 ALTER TABLE FK is emitted.
+        Files.writeString(dir.resolve("V1__cycle_hub.sql"), """
+            CREATE TABLE companies (
+                id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                tenant_id int NOT NULL
+            );
+            CREATE TABLE tenants (
+                id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                company_id int REFERENCES companies
+            );
+            ALTER TABLE companies ADD FOREIGN KEY (tenant_id) REFERENCES tenants ON DELETE CASCADE;
+            CREATE TABLE a_child_1 (id int PRIMARY KEY, tenant_id int NOT NULL REFERENCES tenants ON DELETE CASCADE);
+            CREATE TABLE a_child_2 (id int PRIMARY KEY, tenant_id int NOT NULL REFERENCES tenants ON DELETE CASCADE);
+            CREATE TABLE a_child_3 (id int PRIMARY KEY, tenant_id int NOT NULL REFERENCES tenants ON DELETE CASCADE);
+            """);
+        Files.writeString(dir.resolve("V2__more_children.sql"), """
+            CREATE TABLE a_child_4 (id int PRIMARY KEY, tenant_id int NOT NULL REFERENCES tenants ON DELETE CASCADE);
+            CREATE TABLE a_child_5 (id int PRIMARY KEY, tenant_id int NOT NULL REFERENCES tenants ON DELETE CASCADE);
+            """);
+
+        CompactPgwayMigrationsTask.CompactionSummary summary =
+            CompactPgwayMigrationsTask.compactInPlace(dir, "public", null);
+
+        assertEquals(2, summary.compactedFromVersion());
+        String sql = Files.readString(dir.resolve("V1__cycle_hub.sql"));
+        long alterCount = sql.lines().filter(l -> l.startsWith("ALTER TABLE ")).count();
+        assertEquals(1L, alterCount, "Only the single cycle-closing FK should be deferred to ALTER TABLE:\n" + sql);
+        assertTrue(sql.contains("tenant_id int NOT NULL REFERENCES tenants ON DELETE CASCADE"), sql);
+    }
 }
