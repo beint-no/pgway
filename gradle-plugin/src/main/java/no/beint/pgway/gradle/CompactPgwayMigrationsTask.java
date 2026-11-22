@@ -84,6 +84,12 @@ public abstract class CompactPgwayMigrationsTask extends DefaultTask {
                 summary.originalBytes(),
                 summary.compactedBytes()
             );
+            getLogger().lifecycle(
+                "Note: ensure V{} is already applied in production before deploying this compacted {} (auto-compaction rewrites pgway_history only on databases already at V{}).",
+                summary.compactedFromVersion(),
+                summary.targetV1ScriptName(),
+                summary.compactedFromVersion()
+            );
         } catch (IOException | SQLException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();

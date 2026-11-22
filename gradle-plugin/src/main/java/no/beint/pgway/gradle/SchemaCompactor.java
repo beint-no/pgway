@@ -44,6 +44,8 @@ final class SchemaCompactor {
             + "(?:\\(\\(ARRAY\\[([^]]+)]\\)(?:::text\\[])?\\)|\\(ARRAY\\[([^]]+)](?:::text\\[])?\\))"
     );
     private static final Pattern ARRAY_TEXT_ELEMENT = Pattern.compile("^'(?:[^']|'')*'::(?:text|character varying|bpchar)$");
+    private static final Pattern TEXT_COL_CAST = Pattern.compile("(?:\\(([a-z_][a-z0-9_]*)\\)|\\b([a-z_][a-z0-9_]*))::text\\b");
+    private static final Pattern CMP_NUMERIC_LITERAL = Pattern.compile("(=|<>|!=|<=|>=|<|>)\\s*(?:\\((\\d+(?:\\.\\d+)?)\\)|(\\d+(?:\\.\\d+)?))::numeric\\b");
 
     private static final Set<String> RESERVED_WORDS = Set.of(
         "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric",
@@ -189,7 +191,7 @@ final class SchemaCompactor {
                 if (!dc.name.equals(pgDefaultName(d.name, null, "check"))) {
                     sb.append("CONSTRAINT ").append(quoteIdent(dc.name)).append(' ');
                 }
-                sb.append(cleanCheckDef(dc.def));
+                sb.append(cleanCheckDef(dc.def, Set.of()));
             }
             sb.append(";\n");
         }
@@ -213,13 +215,14 @@ final class SchemaCompactor {
             sb.append(renderTable(table, tablesByOid, tableOrder.deferredFkOids, primarySchema));
 
             // NOT VALID constraints must be added via ALTER TABLE (PostgreSQL silently drops NOT VALID inside CREATE TABLE)
+            Set<String> tableTextCols = textLikeColumns(table);
             for (ConstraintDef con : table.constraints) {
                 if (!con.validated && !tableOrder.deferredFkOids.contains(con.oid)) {
                     sb.append("ALTER TABLE ").append(qualify(table.schema, table.name, primarySchema)).append(" ADD ");
                     if (!isDefaultConstraintName(table, con, tablesByOid)) {
                         sb.append("CONSTRAINT ").append(quoteIdent(con.name)).append(' ');
                     }
-                    sb.append(renderTableConstraint(con, tablesByOid, primarySchema)).append(";\n");
+                    sb.append(renderTableConstraint(con, tablesByOid, primarySchema, tableTextCols)).append(";\n");
                 }
             }
 
@@ -249,7 +252,7 @@ final class SchemaCompactor {
                 allTableRelNames.add(idx.name);
             }
             for (IndexDef idx : table.indexes) {
-                sb.append(renderIndex(idx, table.name, table.schema, primarySchema, allTableRelNames)).append('\n');
+                sb.append(renderIndex(idx, table.name, table.schema, primarySchema, allTableRelNames, tableTextCols)).append('\n');
                 totalIndexes++;
             }
 
@@ -300,7 +303,7 @@ final class SchemaCompactor {
                 viewIdxNames.add(idx.name);
             }
             for (IndexDef idx : view.indexes) {
-                sb.append(renderIndex(idx, view.name, view.schema, primarySchema, viewIdxNames)).append('\n');
+                sb.append(renderIndex(idx, view.name, view.schema, primarySchema, viewIdxNames, Set.of())).append('\n');
                 totalIndexes++;
             }
             if (view.comment != null) {
@@ -402,11 +405,12 @@ final class SchemaCompactor {
             }
         }
 
+        Set<String> textLikeCols = textLikeColumns(table);
         for (ConstraintDef con : table.constraints) {
             if (deferredFkOids.contains(con.oid) || !con.validated) {
                 continue;
             }
-            if (canInlineConstraint(table, con, tablesByOid, colTypeCounts)) {
+            if (canInlineConstraint(table, con, tablesByOid, colTypeCounts, textLikeCols)) {
                 inlinedByCol.computeIfAbsent(con.colNums[0], _ -> new ArrayList<>()).add(con);
             } else {
                 tableLevelConstraints.add(con);
@@ -461,7 +465,7 @@ final class SchemaCompactor {
             }
 
             for (ConstraintDef con : inlined) {
-                sb.append(' ').append(renderInlineConstraint(con, tablesByOid, primarySchema));
+                sb.append(' ').append(renderInlineConstraint(con, tablesByOid, primarySchema, textLikeCols));
             }
 
             if (idx < totalEntries) {
@@ -476,7 +480,7 @@ final class SchemaCompactor {
             if (!isDefaultConstraintName(table, con, tablesByOid)) {
                 sb.append("CONSTRAINT ").append(quoteIdent(con.name)).append(' ');
             }
-            sb.append(renderTableConstraint(con, tablesByOid, primarySchema));
+            sb.append(renderTableConstraint(con, tablesByOid, primarySchema, textLikeCols));
             if (idx < totalEntries) {
                 sb.append(',');
             }
@@ -498,7 +502,8 @@ final class SchemaCompactor {
             TableDef table,
             ConstraintDef con,
             Map<Long, TableDef> tablesByOid,
-            Map<String, Integer> colTypeCounts) {
+            Map<String, Integer> colTypeCounts,
+            Set<String> textLikeCols) {
         if (con.colNums.length != 1) {
             return false;
         }
@@ -521,14 +526,18 @@ final class SchemaCompactor {
             case 'f' -> !con.def.contains(" MATCH FULL") && !con.def.contains(" MATCH PARTIAL");
             case 'c' -> {
                 // Only inline short single-line CHECK constraints so column lines stay crisp.
-                String cleaned = cleanCheckDef(con.def);
+                String cleaned = cleanCheckDef(con.def, textLikeCols);
                 yield cleaned.length() <= 72 && !cleaned.contains("\n");
             }
             default -> false;
         };
     }
 
-    private static String renderInlineConstraint(ConstraintDef con, Map<Long, TableDef> tablesByOid, String primarySchema) {
+    private static String renderInlineConstraint(
+            ConstraintDef con,
+            Map<Long, TableDef> tablesByOid,
+            String primarySchema,
+            Set<String> textLikeCols) {
         return switch (con.type) {
             case 'p' -> "PRIMARY KEY";
             case 'u' -> con.def.startsWith("UNIQUE NULLS NOT DISTINCT") ? "UNIQUE NULLS NOT DISTINCT" : "UNIQUE";
@@ -537,15 +546,19 @@ final class SchemaCompactor {
                 int refIdx = cleaned.indexOf("REFERENCES ");
                 yield refIdx >= 0 ? cleaned.substring(refIdx) : cleaned;
             }
-            case 'c' -> cleanCheckDef(con.def);
+            case 'c' -> cleanCheckDef(con.def, textLikeCols);
             default -> con.def;
         };
     }
 
-    private static String renderTableConstraint(ConstraintDef con, Map<Long, TableDef> tablesByOid, String primarySchema) {
+    private static String renderTableConstraint(
+            ConstraintDef con,
+            Map<Long, TableDef> tablesByOid,
+            String primarySchema,
+            Set<String> textLikeCols) {
         return switch (con.type) {
             case 'f' -> cleanFkDef(con, tablesByOid, primarySchema);
-            case 'c' -> cleanCheckDef(con.def);
+            case 'c' -> cleanCheckDef(con.def, textLikeCols);
             default -> con.def;
         };
     }
@@ -704,7 +717,8 @@ final class SchemaCompactor {
             String tableName,
             String tableSchema,
             String primarySchema,
-            Set<String> allTableRelNames) {
+            Set<String> allTableRelNames,
+            Set<String> textLikeCols) {
         String def = idx.def;
         // Strip default USING btree
         def = def.replaceFirst(" USING btree \\(", " (");
@@ -735,11 +749,11 @@ final class SchemaCompactor {
                 }
             }
         }
-        // Clean up verbose WHERE predicate = ANY ((ARRAY[...])::text[]) / <> ALL (...) into IN / NOT IN
+        // Clean up verbose WHERE predicate (= ANY (ARRAY[...]) -> IN, redundant ::text/::bpchar/::numeric casts)
         int whereIdx = def.indexOf(" WHERE ");
         if (whereIdx > 0) {
             String pred = def.substring(whereIdx + " WHERE ".length());
-            pred = rewriteAnyArrayToIn(pred);
+            pred = cleanSqlExpression(pred, textLikeCols);
             while (isWrappedInSingleParenPair(pred)) {
                 pred = pred.substring(1, pred.length() - 1);
             }
@@ -952,7 +966,17 @@ final class SchemaCompactor {
         return expr;
     }
 
-    private static String cleanCheckDef(String def) {
+    private static Set<String> textLikeColumns(TableDef table) {
+        Set<String> cols = new HashSet<>();
+        for (ColumnDef col : table.columns) {
+            if ("text".equals(col.typeName) || col.typeName.startsWith("character varying")) {
+                cols.add(col.name);
+            }
+        }
+        return cols;
+    }
+
+    private static String cleanCheckDef(String def, Set<String> textLikeCols) {
         String suffix = "";
         String core = def;
         if (core.endsWith(" NOT VALID")) {
@@ -971,9 +995,174 @@ final class SchemaCompactor {
         while (isWrappedInSingleParenPair(inner)) {
             inner = inner.substring(1, inner.length() - 1);
         }
-        // Rewrite PG-normalized `col[::text] = ANY (ARRAY['A'::text, 'B'::text][::text[]])` back into `col IN ('A', 'B')`
-        inner = rewriteAnyArrayToIn(inner);
+        inner = cleanSqlExpression(inner, textLikeCols);
         return "CHECK (" + inner + ")" + suffix;
+    }
+
+    /**
+     * Simplifies PostgreSQL's canonicalized {@code CHECK} / index {@code WHERE} expressions while
+     * preserving exact AST semantics (verified against PostgreSQL 19+ during compaction):
+     * <ul>
+     *   <li>{@code col = ANY (ARRAY['A'::text, ...])} → {@code col IN ('A', ...)}</li>
+     *   <li>{@code col::text} / {@code (col)::text} → {@code col} when {@code col} is {@code text} or {@code varchar}</li>
+     *   <li>{@code 'lit'::text} / {@code 'lit'::bpchar} → {@code 'lit'} outside {@code ARRAY[...]}</li>
+     *   <li>{@code >= 0::numeric} / {@code >= (0)::numeric} → {@code >= 0} on comparison RHS</li>
+     * </ul>
+     */
+    static String cleanSqlExpression(String expr, Set<String> textLikeCols) {
+        String out = rewriteAnyArrayToIn(expr);
+        if (!textLikeCols.isEmpty()) {
+            out = stripTextColCasts(out, textLikeCols);
+        }
+        out = stripTextLiteralCasts(out);
+        out = stripNumericComparisonLiteralCasts(out);
+        return out;
+    }
+
+    private static String stripTextColCasts(String expr, Set<String> textLikeCols) {
+        // Walk outside single-quoted string literals so we never mutate string contents.
+        StringBuilder sb = new StringBuilder(expr.length());
+        int n = expr.length();
+        int segStart = 0;
+        boolean inQuote = false;
+        for (int i = 0; i < n; i++) {
+            char c = expr.charAt(i);
+            if (c == '\'') {
+                if (!inQuote) {
+                    appendCleanedColSegment(sb, expr.substring(segStart, i), textLikeCols);
+                    segStart = i;
+                    inQuote = true;
+                } else if (i + 1 < n && expr.charAt(i + 1) == '\'') {
+                    i++;
+                } else {
+                    sb.append(expr, segStart, i + 1);
+                    segStart = i + 1;
+                    inQuote = false;
+                }
+            }
+        }
+        if (segStart < n) {
+            if (inQuote) {
+                sb.append(expr, segStart, n);
+            } else {
+                appendCleanedColSegment(sb, expr.substring(segStart), textLikeCols);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void appendCleanedColSegment(StringBuilder out, String segment, Set<String> textLikeCols) {
+        Matcher m = TEXT_COL_CAST.matcher(segment);
+        int last = 0;
+        while (m.find()) {
+            String col = m.group(1) != null ? m.group(1) : m.group(2);
+            if (textLikeCols.contains(col)) {
+                out.append(segment, last, m.start());
+                out.append(col);
+                last = m.end();
+            }
+        }
+        out.append(segment, last, segment.length());
+    }
+
+    private static String stripTextLiteralCasts(String expr) {
+        StringBuilder sb = new StringBuilder(expr.length());
+        int n = expr.length();
+        int arrayDepth = 0;
+        for (int i = 0; i < n; ) {
+            char c = expr.charAt(i);
+            if (c == '[') {
+                arrayDepth++;
+                sb.append(c);
+                i++;
+            } else if (c == ']') {
+                if (arrayDepth > 0) {
+                    arrayDepth--;
+                }
+                sb.append(c);
+                i++;
+            } else if (c == '\'') {
+                int start = i;
+                i++;
+                while (i < n) {
+                    if (expr.charAt(i) == '\'') {
+                        if (i + 1 < n && expr.charAt(i + 1) == '\'') {
+                            i += 2;
+                        } else {
+                            i++;
+                            break;
+                        }
+                    } else {
+                        i++;
+                    }
+                }
+                sb.append(expr, start, i);
+                if (arrayDepth == 0) {
+                    if (expr.startsWith("::text", i) && !isIdentOrArrayContinue(expr, i + "::text".length())) {
+                        i += "::text".length();
+                    } else if (expr.startsWith("::bpchar", i) && !isIdentOrArrayContinue(expr, i + "::bpchar".length())) {
+                        i += "::bpchar".length();
+                    }
+                }
+            } else {
+                sb.append(c);
+                i++;
+            }
+        }
+        return sb.toString();
+    }
+
+    private static boolean isIdentOrArrayContinue(String s, int pos) {
+        if (pos >= s.length()) {
+            return false;
+        }
+        char c = s.charAt(pos);
+        return Character.isLetterOrDigit(c) || c == '_' || c == '[' || c == ':';
+    }
+
+    private static String stripNumericComparisonLiteralCasts(String expr) {
+        // Only outside quotes: rewrite `>= 0::numeric` or `>= (0)::numeric` -> `>= 0`.
+        StringBuilder sb = new StringBuilder(expr.length());
+        int n = expr.length();
+        int segStart = 0;
+        boolean inQuote = false;
+        for (int i = 0; i < n; i++) {
+            char c = expr.charAt(i);
+            if (c == '\'') {
+                if (!inQuote) {
+                    appendCleanedNumericSegment(sb, expr.substring(segStart, i));
+                    segStart = i;
+                    inQuote = true;
+                } else if (i + 1 < n && expr.charAt(i + 1) == '\'') {
+                    i++;
+                } else {
+                    sb.append(expr, segStart, i + 1);
+                    segStart = i + 1;
+                    inQuote = false;
+                }
+            }
+        }
+        if (segStart < n) {
+            if (inQuote) {
+                sb.append(expr, segStart, n);
+            } else {
+                appendCleanedNumericSegment(sb, expr.substring(segStart));
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void appendCleanedNumericSegment(StringBuilder out, String segment) {
+        Matcher m = CMP_NUMERIC_LITERAL.matcher(segment);
+        int last = 0;
+        while (m.find()) {
+            String op = m.group(1);
+            String num = m.group(2) != null ? m.group(2) : m.group(3);
+            out.append(segment, last, m.start());
+            out.append(op).append(' ').append(num);
+            last = m.end();
+        }
+        out.append(segment, last, segment.length());
     }
 
     private static String rewriteAnyArrayToIn(String expr) {
