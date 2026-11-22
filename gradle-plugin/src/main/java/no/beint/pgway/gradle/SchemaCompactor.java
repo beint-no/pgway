@@ -1163,15 +1163,25 @@ final class SchemaCompactor {
             if (!ready.isEmpty()) {
                 next = ready.pollFirst();
             } else {
-                // Cycle breaker: pick remaining table with smallest in-degree, breaking ties alphabetically
-                // (never emit a child partition before its parent).
-                next = tablesByOid.values().stream()
-                    .filter(t -> !emitted.contains(t.oid))
+                // Break cycles only inside source strongly-connected components (never pick a leaf
+                // table that is merely waiting on a cycle), preferring the hub table with the
+                // fewest FKs to unemitted tables and the most unemitted dependents.
+                Set<Long> candidates = findSourceSccCandidates(tablesByOid, deps, emitted);
+                next = candidates.stream()
+                    .map(tablesByOid::get)
                     .filter(t -> !t.isPartition || emitted.contains(t.partitionParentOid))
                     .min(Comparator
-                        .comparingInt((TableDef t) -> inDegree.get(t.oid))
+                        .comparingInt((TableDef t) -> countUnemittedFks(t, emitted, tablesByOid))
+                        .thenComparingInt(t -> -countUnemittedDependents(t.oid, rdeps, emitted))
                         .thenComparing(tieBreaker))
-                    .orElseThrow();
+                    .orElseGet(() -> tablesByOid.values().stream()
+                        .filter(t -> !emitted.contains(t.oid))
+                        .filter(t -> !t.isPartition || emitted.contains(t.partitionParentOid))
+                        .min(Comparator
+                            .comparingInt((TableDef t) -> countUnemittedFks(t, emitted, tablesByOid))
+                            .thenComparingInt(t -> -countUnemittedDependents(t.oid, rdeps, emitted))
+                            .thenComparing(tieBreaker))
+                        .orElseThrow());
             }
             ordered.add(next);
             emitted.add(next.oid);
@@ -1220,6 +1230,123 @@ final class SchemaCompactor {
             }
         }
         return new TableOrderResult(ordered, deferredFkOids, deferredFks);
+    }
+
+    /**
+     * Finds all nodes belonging to source strongly-connected components of the unemitted dependency
+     * graph (SCCs that have zero dependencies on any other unemitted SCC). Breaking a cycle inside
+     * a source SCC unlocks every downstream table without deferring their FKs.
+     */
+    private static Set<Long> findSourceSccCandidates(
+            Map<Long, TableDef> tablesByOid,
+            Map<Long, Set<Long>> deps,
+            Set<Long> emitted) {
+        Map<Long, Integer> index = new HashMap<>();
+        Map<Long, Integer> lowlink = new HashMap<>();
+        Set<Long> onStack = new HashSet<>();
+        Deque<Long> stack = new ArrayDeque<>();
+        List<Set<Long>> sccs = new ArrayList<>();
+        int[] nextIndex = {0};
+
+        for (Long oid : tablesByOid.keySet()) {
+            if (!emitted.contains(oid) && !index.containsKey(oid)) {
+                tarjanScc(oid, deps, emitted, index, lowlink, onStack, stack, sccs, nextIndex);
+            }
+        }
+
+        // Map each unemitted node to its SCC id
+        Map<Long, Integer> sccOf = new HashMap<>();
+        for (int i = 0; i < sccs.size(); i++) {
+            for (Long oid : sccs.get(i)) {
+                sccOf.put(oid, i);
+            }
+        }
+
+        // Source SCCs in the dependency graph are SCCs with no dependency edge leaving the SCC.
+        Set<Long> candidates = new LinkedHashSet<>();
+        for (int i = 0; i < sccs.size(); i++) {
+            Set<Long> scc = sccs.get(i);
+            boolean hasExternalDep = false;
+            for (Long oid : scc) {
+                for (Long dep : deps.getOrDefault(oid, Set.of())) {
+                    if (!emitted.contains(dep) && !sccOf.get(dep).equals(i)) {
+                        hasExternalDep = true;
+                        break;
+                    }
+                }
+                if (hasExternalDep) {
+                    break;
+                }
+            }
+            if (!hasExternalDep) {
+                candidates.addAll(scc);
+            }
+        }
+        return candidates;
+    }
+
+    private static void tarjanScc(
+            long v,
+            Map<Long, Set<Long>> deps,
+            Set<Long> emitted,
+            Map<Long, Integer> index,
+            Map<Long, Integer> lowlink,
+            Set<Long> onStack,
+            Deque<Long> stack,
+            List<Set<Long>> sccs,
+            int[] nextIndex) {
+        int idx = nextIndex[0]++;
+        index.put(v, idx);
+        lowlink.put(v, idx);
+        stack.push(v);
+        onStack.add(v);
+
+        for (Long w : deps.getOrDefault(v, Set.of())) {
+            if (emitted.contains(w)) {
+                continue;
+            }
+            if (!index.containsKey(w)) {
+                tarjanScc(w, deps, emitted, index, lowlink, onStack, stack, sccs, nextIndex);
+                lowlink.put(v, Math.min(lowlink.get(v), lowlink.get(w)));
+            } else if (onStack.contains(w)) {
+                lowlink.put(v, Math.min(lowlink.get(v), index.get(w)));
+            }
+        }
+
+        if (lowlink.get(v).equals(index.get(v))) {
+            Set<Long> scc = new LinkedHashSet<>();
+            while (true) {
+                long w = stack.pop();
+                onStack.remove(w);
+                scc.add(w);
+                if (w == v) {
+                    break;
+                }
+            }
+            sccs.add(scc);
+        }
+    }
+
+    private static int countUnemittedFks(TableDef t, Set<Long> emitted, Map<Long, TableDef> tablesByOid) {
+        int count = 0;
+        for (ConstraintDef con : t.constraints) {
+            if (con.type == 'f' && con.refTableOid != t.oid
+                    && tablesByOid.containsKey(con.refTableOid)
+                    && !emitted.contains(con.refTableOid)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int countUnemittedDependents(long oid, Map<Long, Set<Long>> rdeps, Set<Long> emitted) {
+        int count = 0;
+        for (Long dep : rdeps.getOrDefault(oid, Set.of())) {
+            if (!emitted.contains(dep)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static List<ViewDef> orderViews(Map<Long, ViewDef> viewsByOid, Connection conn, String primarySchema)
