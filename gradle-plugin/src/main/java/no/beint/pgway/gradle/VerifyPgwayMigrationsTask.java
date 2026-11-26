@@ -3,6 +3,8 @@ package no.beint.pgway.gradle;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.List;
 import no.beint.pgway.FilesystemMigrationSource;
 import no.beint.pgway.MigrationResult;
@@ -16,6 +18,7 @@ import org.gradle.api.GradleException;
 import org.gradle.api.file.DirectoryProperty;
 import org.gradle.api.file.RegularFileProperty;
 import org.gradle.api.provider.Property;
+import org.gradle.api.provider.SetProperty;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputDirectory;
 import org.gradle.api.tasks.Optional;
@@ -27,7 +30,7 @@ import org.gradle.work.DisableCachingByDefault;
 
 /**
  * Verifies all SQL migrations in {@code src/main/resources/db/migration} by running strict offline
- * validation followed by a full replay against a disposable PostgreSQL 19+ database.
+ * validation, full replay against a disposable PostgreSQL 19+ database, and build-time schema linting.
  */
 @DisableCachingByDefault(because = "Verifies migrations against the PostgreSQL 19+ server binaries installed on this host")
 public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
@@ -43,6 +46,22 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
     @Optional
     public abstract Property<String> getPostgresBin();
 
+    @Input
+    public abstract Property<Boolean> getLintRedundantIndexes();
+
+    @Input
+    public abstract Property<Boolean> getLintUnreferencedCompositeUnique();
+
+    @Input
+    @Optional
+    public abstract Property<String> getTenantColumn();
+
+    @Input
+    public abstract SetProperty<String> getAllowedCrossTenantForeignKeys();
+
+    @Input
+    public abstract Property<Boolean> getForbidExplicitNames();
+
     @OutputFile
     public abstract RegularFileProperty getReceiptFile();
 
@@ -50,6 +69,13 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
     public void verify() {
         Path migrationsPath = getMigrationsDir().get().getAsFile().toPath();
         String schema = getSchema().get();
+        SchemaLinter.LintConfig lintConfig = new SchemaLinter.LintConfig(
+            getLintRedundantIndexes().get(),
+            getLintUnreferencedCompositeUnique().get(),
+            getTenantColumn().getOrNull(),
+            getAllowedCrossTenantForeignKeys().get(),
+            getForbidExplicitNames().get()
+        );
 
         // Read migration files from disk once and reuse the snapshot across all verification steps.
         List<RawMigrationResource> snapshot;
@@ -66,7 +92,7 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
             throw new PgwayValidationException(offline.issues());
         }
 
-        // 2. Full replay against a disposable PostgreSQL 19+ database + idempotency check
+        // 2. Full replay against a disposable PostgreSQL 19+ database + schema lint + idempotency check
         try (var cluster = new DisposablePostgresCluster(getPostgresBin().getOrNull())) {
             Pgway pgway = Pgway.configure()
                 .dataSource(cluster.dataSource())
@@ -82,6 +108,14 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
                 );
             }
             pgway.validateOrThrow();
+
+            // 3. Build-time schema lint against live PG 19 catalog + migration SQL
+            try (Connection conn = cluster.dataSource().getConnection()) {
+                List<SchemaLinter.LintViolation> violations = SchemaLinter.lint(conn, schema, snapshot, lintConfig);
+                if (!violations.isEmpty()) {
+                    throw new GradleException(SchemaLinter.formatReport(violations));
+                }
+            }
 
             MigrationResult second = pgway.migrate();
             if (second.appliedCount() != 0) {
@@ -105,7 +139,7 @@ public abstract class VerifyPgwayMigrationsTask extends DefaultTask {
                 schema,
                 first.totalDuration().toMillis()
             );
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException | SQLException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }

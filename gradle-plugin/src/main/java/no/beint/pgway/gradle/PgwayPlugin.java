@@ -1,5 +1,6 @@
 package no.beint.pgway.gradle;
 
+import java.util.Set;
 import no.beint.pgway.PgwayConfig;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
@@ -14,16 +15,25 @@ public final class PgwayPlugin implements Plugin<Project> {
     public void apply(Project project) {
         PgwayExtension extension = project.getExtensions().create("pgway", PgwayExtension.class);
         extension.getSchema().convention(PgwayConfig.DEFAULT_SCHEMA);
+        extension.getLintRedundantIndexes().convention(true);
+        extension.getLintUnreferencedCompositeUnique().convention(true);
+        extension.getAllowedCrossTenantForeignKeys().convention(Set.of());
+        extension.getForbidExplicitNames().convention(false);
 
         TaskProvider<VerifyPgwayMigrationsTask> verifyTask = project.getTasks().register(
             "verifyPgwayMigrations",
             VerifyPgwayMigrationsTask.class,
             task -> {
                 task.setGroup("verification");
-                task.setDescription("Validates and replays SQL migrations against PostgreSQL 19+.");
+                task.setDescription("Validates, replays, and lints SQL migrations against PostgreSQL 19+.");
                 task.getMigrationsDir().set(project.getLayout().getProjectDirectory().dir("src/main/resources/db/migration"));
                 task.getSchema().set(extension.getSchema());
                 task.getPostgresBin().set(extension.getPostgresBin());
+                task.getLintRedundantIndexes().set(extension.getLintRedundantIndexes());
+                task.getLintUnreferencedCompositeUnique().set(extension.getLintUnreferencedCompositeUnique());
+                task.getTenantColumn().set(extension.getTenantColumn());
+                task.getAllowedCrossTenantForeignKeys().set(extension.getAllowedCrossTenantForeignKeys());
+                task.getForbidExplicitNames().set(extension.getForbidExplicitNames());
                 task.getReceiptFile().set(project.getLayout().getBuildDirectory().file("pgway/verified.txt"));
             }
         );

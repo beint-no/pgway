@@ -30,31 +30,50 @@ Requires **JDK 27** and **PostgreSQL 19 or higher**.
 - **JDK 27 `ScopedValue` context:** `Pgway.currentMigration()` exposes an immutable `MigrationContext` (`schema`, `version`, `script`, `checksum`, `startedAt`) to `MigrationListener`s with zero `ThreadLocal` leaks.
 - **Fail-closed on non-empty schemas:** if `pgway_history` does not exist and the target schema already contains user tables/objects, `migrate()` and `validate()` refuse to proceed instead of replaying `V1..Vn` against an existing database (extension-owned objects are ignored).
 - **Seamless migration compaction (`compactPgwayMigrations`):** squash `V1..Vn` into a single, compact, idiomatic `V1` schema file (folding `ALTER TABLE` changes directly into `CREATE TABLE`, omitting PG-default names and `USING btree`, preserving PG 19 `VIRTUAL`/`STORED` columns, storage settings, views, functions, triggers, comments, and conditional external-role grant blocks). Before rewriting any file, Pgway proves against a disposable PostgreSQL 19+ cluster that no tables contain seed rows, that the compacted `V1` is 100% catalog-equivalent to `V1..Vn`, and that existing `V1..Vn` databases auto-compact their `pgway_history` via the embedded `-- pgway: replaces=V<n>:<chain-sha256>` directive on next startup (zero manual DB patching).
+- **Build-time schema lint (`verifyPgwayMigrations`):** inspects the live PostgreSQL 19+ catalog right after replay to catch redundant B-tree indexes, unreferenced composite `UNIQUE` constraints containing the primary key, non-composite foreign keys between tenant-scoped tables, and (optionally) explicit `CONSTRAINT` / `INDEX` names in migration SQL.
 
 ## Usage
 
-### Build-time verification and compaction (`no.beint.pgway` Gradle plugin)
+### Build-time verification, linting, and compaction (`no.beint.pgway` Gradle plugin)
 
 ```kotlin
 plugins {
-    id("no.beint.pgway") version "3.1.0"
+    id("no.beint.pgway") version "3.2.0"
 }
 ```
 
-That's all for `public` schema apps. For a custom schema:
+That's all for `public` schema apps. Optional configuration under `pgway {}`:
 
 ```kotlin
 pgway {
     schema.set("utin")
+    lintRedundantIndexes.set(true)               // default: true
+    lintUnreferencedCompositeUnique.set(true)    // default: true
+    tenantColumn.set("tenant_id")                // optional; enforces composite tenant FKs
+    allowedCrossTenantForeignKeys.addAll(
+        "audit_links.source_id",
+        "transfers(from_account_id,to_account_id)",
+    )
+    forbidExplicitNames.set(true)                // default: false
 }
 ```
 
-- `verifyPgwayMigrations` runs automatically on `processResources` and `check` (incremental and `UP-TO-DATE` in 0 ms when migrations are unchanged).
+| Option | Default | Purpose |
+|---|---|---|
+| `schema` | `"public"` | Target PostgreSQL schema |
+| `postgresBin` | unset | Path to PostgreSQL 19+ `bin` directory when not on `PATH` or standard locations |
+| `lintRedundantIndexes` | `true` | Fails when a B-tree index is strictly covered by another index on the same table (prefix keys + opclass/direction/nulls, same predicate, covered `INCLUDE` columns) |
+| `lintUnreferencedCompositeUnique` | `true` | Fails when a composite `UNIQUE` constraint containing the table's `PRIMARY KEY` is not referenced by any foreign key |
+| `tenantColumn` | unset | When set, fails when a foreign key between two tables carrying `tenantColumn` omits `tenantColumn` from its referencing columns |
+| `allowedCrossTenantForeignKeys` | empty | Allowlist for `tenantColumn` checks, formatted as `"table.column"` or `"table(col1,col2)"` (optional `schema.` prefix supported) |
+| `forbidExplicitNames` | `false` | Fails on explicit `CONSTRAINT <name>` or `CREATE [UNIQUE] INDEX [CONCURRENTLY] <name> ON` in migration scripts (`V2+`, or all scripts when `V1` was not compacted; `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS <name>` is exempt) |
+
+- `verifyPgwayMigrations` runs automatically on `processResources` and `check` (incremental and `UP-TO-DATE` in 0 ms when migrations and lint settings are unchanged).
 - `compactPgwayMigrations` runs on demand (`./gradlew compactPgwayMigrations`) to squash `V1..Vn` into a verified `V1` with automatic history compaction for existing databases.
 
 ### Spring Boot 4 (`no.beint.pgway:spring`)
 
-Add `implementation("no.beint.pgway:spring:3.1.0")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
+Add `implementation("no.beint.pgway:spring:3.2.0")` alongside `org.postgresql:postgresql`. **Zero configuration** is needed for the default `public` schema. Available properties under `pgway.*`:
 
 | Property | Default | Purpose |
 |---|---|---|
